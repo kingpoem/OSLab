@@ -1,0 +1,5 @@
+*.bin
+*.o
+*.pdf
+
+os-image

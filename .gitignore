@@ -1,5 +1,8 @@
 *.bin
 *.o
 *.pdf
+*.md
 
 os-image
+
+doc/

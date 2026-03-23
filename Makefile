@@ -1,5 +1,3 @@
-CC = x86_64-elf-gcc
-LD = x86_64-elf-ld
 # Automatically generate lists of sources using wildcard.
 C_SOURCES = $(wildcard *.c)
 HEADERS = $(wildcard *.h)
@@ -21,7 +19,7 @@ clean:
 
 # Create kernel binary by linking kernel entry code to kernel_main.
 kernel.bin: enter_kernel.o stdio.o kernel.o
-	$(LD) -melf_i386 -o $@ -Ttext 0x1000 --oformat binary --entry kernel_main $^
+	ld -melf_i386 -o $@ -Ttext 0x1000 --oformat binary --entry kernel_main $^
 
 # Create executable image by prepending kernel binary with boot sector.
 os-image: boot.bin kernel.bin
@@ -37,7 +35,7 @@ os-image: boot.bin kernel.bin
 
 # Compile C sources into object files.
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	gcc $(CFLAGS) -c $< -o $@
 
 # --------------------------------------------------------------------------------------------------
 

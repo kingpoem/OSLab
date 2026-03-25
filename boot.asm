@@ -1,8 +1,11 @@
 [org 0x7c00]      ; Bootloader is loaded into memory starting at 0x7c00
 
 KERNEL_OFFSET equ 0x1000  ; This is the memory offset into which we will load our kernel.
-KERNEL_START_ADDRESS equ 0x9000 ; This is the location to which the kernel will be loaded.
-KERNEL_SECTORS equ 10  ; Number of disk sectors to read for the kernel.
+KERNEL_START_ADDRESS equ 0x9000 ; Stack top for real/protected mode (in 0x0000-0xFFFF).
+; We will not rely on kernel size; we'll stop early when disk read fails.
+; Note: real-mode stack is at 0x9000, so keep kernel load end below it.
+KERNEL_SECTORS equ 63 ; Max sectors to try (kernel ends at <= 0x8FFF).
+KERNEL_LBA_START equ 1 ; LBA where kernel.bin begins in the raw image.
 CODE_SEG equ 0x08      ; Protected-mode code segment selector (CS).
 DATA_SEG equ 0x10      ; Protected-mode data segment selector (DS/SS/ES/FS/GS).
 
@@ -54,17 +57,30 @@ load_kernel_from_disk:
 
   mov bx, MSG_LOAD_KERNEL ; Print message for kernel load.
   call print_string
-  mov ax, 0x0000            ; Set ES base to 0x0000 so ES:BX points to the load buffer.
-  mov es, ax                ; ES selects the segment for the destination address.
-  mov bx, KERNEL_OFFSET     ; Destination offset within ES for the kernel.
-  mov dl, [BOOT_DRIVE]      ; Boot drive number saved earlier by the BIOS.
-  mov ah, 0x02               ; INT 13h function: read sectors into memory.
-  mov al, KERNEL_SECTORS    ; Number of sectors to read.
-  mov ch, 0x00              ; Cylinder (track) number (low byte).
-  mov dh, 0x00              ; Head number.
-  mov cl, 0x02              ; Starting sector number.
-  int 0x13                  ; Call BIOS disk service.
-  jc disk_error             ; Jump if carry flag indicates a disk read error.
+  ; Load kernel via LBA using INT 13h AH=42h (Disk Address Packet).
+  ; We read one sector at a time and stop on failure, so we don't need
+  ; to know kernel.bin size at build time.
+  xor di, di                 ; di = number of successfully loaded sectors
+  mov si, dap_packet        ; DS:SI -> DAP
+  mov cx, KERNEL_SECTORS   ; maximum sectors to try
+
+.read_loop:
+  mov dl, [BOOT_DRIVE]      ; drive id saved earlier by BIOS
+  mov ah, 0x42              ; extended read
+  mov word [dap_sector_count], 1
+  int 0x13
+  jc .read_failed
+
+  inc di
+  add dword [dap_lba_low], 1
+  add word [dap_buffer_offset], 0x0200 ; +512 bytes
+  loop .read_loop
+
+  ret
+
+.read_failed:
+  test di, di
+  jz disk_error
   ret
 
 disk_error:
@@ -164,6 +180,28 @@ MSG_DISK_ERROR:
 
 MSG_PMODE:
   db "successfully landed in 32-bit protected mode.", 0x0
+
+; Disk Address Packet for INT 13h AH=42h (extended read).
+; DAP layout (16 bytes):
+;  +0  size (0x10)
+;  +1  reserved
+;  +2  sectors to read (word)
+;  +4  buffer offset (word)
+;  +6  buffer segment (word)
+;  +8  starting LBA (qword)
+dap_packet:
+  db 0x10
+  db 0x00
+dap_sector_count:
+  dw 0x0001
+dap_buffer_offset:
+  dw KERNEL_OFFSET
+dap_buffer_segment:
+  dw 0x0000
+dap_lba_low:
+  dd KERNEL_LBA_START
+dap_lba_high:
+  dd 0x00000000
 
 ; Boot sector padding
 times 510-($-$$) db 0x0

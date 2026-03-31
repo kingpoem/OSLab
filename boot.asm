@@ -54,9 +54,6 @@ load_kernel_from_disk:
   mov bx, MSG_LOAD_KERNEL ; Print message for kernel load.
   call print_string
 
-  ; Read kernel with BIOS INT 13h AH=0x02 (CHS mode).
-  ; On hard-disk geometry (typically 63 sectors/track), read 25 sectors
-  ; continuously from cylinder 0, head 0, sector 2.
   mov dl, [BOOT_DRIVE]
   mov ah, 0x02
   mov al, 25
@@ -65,16 +62,16 @@ load_kernel_from_disk:
   mov dh, 0x00
   mov bx, KERNEL_OFFSET
   int 0x13
-  jc disk_error_first
+  jc disk_error
 
   ret
 
-disk_error_first:
-  mov bx, MSG_DISK_ERROR_FIRST
+disk_error:
+  mov bx, MSG_DISK_ERROR
   call print_string
   jmp $
 
-MSG_DISK_ERROR_FIRST:
+MSG_DISK_ERROR:
   db "disk read error: read failed", 0x0
 
 
@@ -111,8 +108,6 @@ gdt_descriptor:
   dw gdt_end - gdt_start - 1
   dd gdt_start
 
-
-
 ;
 ; Part 3
 ;
@@ -132,8 +127,6 @@ switch_to_pm:
   mov cr0, eax
   jmp CODE_SEG:init_pm
 
-
-
 [bits 32]
 
 ; Some other function(s) that set the registers and stack pointers
@@ -147,11 +140,6 @@ init_pm:
   mov gs, ax
   mov esp, KERNEL_START_ADDRESS
   jmp BEGIN_PM
-
-
-
-
-
 
 ;
 ; Finally... This is the entry point for 32-bit code and we'll not return from it.

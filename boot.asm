@@ -2,6 +2,8 @@
 
 KERNEL_OFFSET equ 0x1000  ; This is the memory offset into which we will load our kernel.
 KERNEL_START_ADDRESS equ 0x9000 ; This is the location to which the kernel will be loaded.
+CODE_SEG equ 0x08
+DATA_SEG equ 0x10
 
 [bits 16]
 
@@ -52,9 +54,28 @@ load_kernel_from_disk:
   mov bx, MSG_LOAD_KERNEL ; Print message for kernel load.
   call print_string
 
-  ; ...
+  ; Read kernel with BIOS INT 13h AH=0x02 (CHS mode).
+  ; On hard-disk geometry (typically 63 sectors/track), read 25 sectors
+  ; continuously from cylinder 0, head 0, sector 2.
+  mov dl, [BOOT_DRIVE]
+  mov ah, 0x02
+  mov al, 25
+  mov ch, 0x00
+  mov cl, 0x02
+  mov dh, 0x00
+  mov bx, KERNEL_OFFSET
+  int 0x13
+  jc disk_error_first
 
   ret
+
+disk_error_first:
+  mov bx, MSG_DISK_ERROR_FIRST
+  call print_string
+  jmp $
+
+MSG_DISK_ERROR_FIRST:
+  db "disk read error: read failed", 0x0
 
 
 ;
@@ -65,13 +86,30 @@ load_kernel_from_disk:
 ;
 
 gdt_start:
-; ...
+gdt_null:
+  dq 0x0000000000000000
+
+gdt_code:
+  dw 0xFFFF
+  dw 0x0000
+  db 0x00
+  db 10011010b
+  db 11001111b
+  db 0x00
+
+gdt_data:
+  dw 0xFFFF
+  dw 0x0000
+  db 0x00
+  db 10010010b
+  db 11001111b
+  db 0x00
 
 gdt_end:
-; ...
 
 gdt_descriptor:
-; ...
+  dw gdt_end - gdt_start - 1
+  dd gdt_start
 
 
 
@@ -87,8 +125,12 @@ gdt_descriptor:
 [bits 16]
 
 switch_to_pm:
-; ...
-call init_pm
+  cli
+  lgdt [gdt_descriptor]
+  mov eax, cr0
+  or eax, 0x1
+  mov cr0, eax
+  jmp CODE_SEG:init_pm
 
 
 
@@ -97,7 +139,14 @@ call init_pm
 ; Some other function(s) that set the registers and stack pointers
 ; At the end of the function, call BEGIN_PM
 init_pm:
-call BEGIN_PM
+  mov ax, DATA_SEG
+  mov ds, ax
+  mov ss, ax
+  mov es, ax
+  mov fs, ax
+  mov gs, ax
+  mov esp, KERNEL_START_ADDRESS
+  jmp BEGIN_PM
 
 
 

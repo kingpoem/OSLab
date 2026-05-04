@@ -116,6 +116,55 @@ static void free_phys_page_locked(unsigned long ppn) {
     }
 }
 
+/*
+ * 在虚拟位图中查找 n 个连续的空闲虚拟页，返回起始虚拟页号；找不到返回 -1。
+ * 起点跳过虚拟页 0（已保留为非法地址）。
+ * 调用方需自行持有 vm_lock。
+ */
+static long find_free_vpages_locked(unsigned long n) {
+    if (n == 0) return -1;
+    unsigned long start = 1;
+    unsigned long count = 0;
+    for (unsigned long i = 1; i < g_vm.num_v_pages; i++) {
+        if (!get_bit(g_vm.virt_bitmap, i)) {
+            if (count == 0) start = i;
+            count++;
+            if (count == n) return (long)start;
+        } else {
+            count = 0;
+        }
+    }
+    return -1;
+}
+
+/*
+ * 清除给定虚拟地址对应的页表项（PTE）；返回原物理地址（pa），失败返回 0。
+ * 调用方需自行持有 vm_lock。
+ */
+static unsigned long clear_pte_locked(pde_t *pgdir, unsigned long vaddr) {
+    unsigned long pde_idx = get_pde_idx(vaddr);
+    unsigned long pte_idx = get_pte_idx(vaddr);
+    if (pgdir[pde_idx] == 0) return 0;
+    pte_t *page_table = (pte_t *)(g_vm.phys_mem + pgdir[pde_idx]);
+    unsigned long old = (unsigned long)page_table[pte_idx];
+    page_table[pte_idx] = 0;
+    return old;
+}
+
+/*
+ * 在 TLB 中查找并使包含 vpn 的条目失效。
+ * 用于 myFree 等操作释放虚拟页时刷新 TLB。
+ */
+static void invalidateTLBEntry(unsigned long vpn) {
+    pthread_mutex_lock(&g_vm.tlb_lock);
+    for (int i = 0; i < TLB_SIZE; i++) {
+        if (g_vm.tlb.entry[i].valid && g_vm.tlb.entry[i].v_page == vpn) {
+            g_vm.tlb.entry[i].valid = false;
+        }
+    }
+    pthread_mutex_unlock(&g_vm.tlb_lock);
+}
+
 
 /*
  * 负责分配并设置模拟的物理内存与磁盘空间。
@@ -291,21 +340,102 @@ void printTLBStats() {
 /*
  * 分配 num_bytes 字节并返回起始虚拟地址。
  * 内部按页粒度分配；若需多于一页则分配连续的虚拟页，
- * 但物理页可不连续。
+ * 但对应的物理页可不连续。
+ * 物理内存不足时返回 NULL。
  */
 void *myMalloc(unsigned int num_bytes) {
-    (void)num_bytes;
-    return NULL;
+    if (num_bytes == 0) return NULL;
+    if (!g_vm.initialized) initMemoryAndDisk();
+    if (!g_vm.initialized) return NULL;
+
+    unsigned long n_pages = (num_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    pthread_mutex_lock(&g_vm.vm_lock);
+
+    long start_vpn = find_free_vpages_locked(n_pages);
+    if (start_vpn < 0) {
+        pthread_mutex_unlock(&g_vm.vm_lock);
+        return NULL;
+    }
+
+    /* 为每一虚拟页分配并映射一个物理页。失败时回滚。 */
+    unsigned long allocated_ppns[n_pages];
+    for (unsigned long i = 0; i < n_pages; i++) allocated_ppns[i] = (unsigned long)-1;
+
+    int ok = 1;
+    for (unsigned long i = 0; i < n_pages; i++) {
+        long ppn = alloc_phys_page_locked();
+        if (ppn < 0) { ok = 0; break; }
+        allocated_ppns[i] = (unsigned long)ppn;
+        unsigned long vaddr = (unsigned long)(start_vpn + i) * PAGE_SIZE;
+        unsigned long paddr = (unsigned long)ppn * PAGE_SIZE;
+        if (pageMap(g_vm.page_dir, (void *)vaddr, (void *)paddr) != 0) {
+            ok = 0;
+            break;
+        }
+        set_bit(g_vm.virt_bitmap, (unsigned long)(start_vpn + i));
+    }
+
+    if (!ok) {
+        for (unsigned long i = 0; i < n_pages; i++) {
+            if (allocated_ppns[i] != (unsigned long)-1) {
+                free_phys_page_locked(allocated_ppns[i]);
+            }
+            unsigned long vpn = (unsigned long)(start_vpn + i);
+            if (get_bit(g_vm.virt_bitmap, vpn)) {
+                clear_pte_locked(g_vm.page_dir, vpn * PAGE_SIZE);
+                clear_bit(g_vm.virt_bitmap, vpn);
+            }
+        }
+        pthread_mutex_unlock(&g_vm.vm_lock);
+        return NULL;
+    }
+
+    pthread_mutex_unlock(&g_vm.vm_lock);
+    return (void *)((unsigned long)start_vpn * PAGE_SIZE);
 }
 
 
 /*
- * 释放从虚拟地址 va 起 size 字节占用的所有页。
- * 仅当所有目标页均已分配时才执行释放并返回成功；否则输出 Segmentation Fault。
+ * 释放从虚拟地址 va 起 size 字节占用的所有页（按页粒度）。
+ * 仅当所有目标页均已分配时才执行释放；否则输出 Segmentation Fault 且不释放任何页。
  */
 void myFree(void *va, int size) {
-    (void)va;
-    (void)size;
+    if (size <= 0) return;
+    if (!g_vm.initialized) {
+        printf("Segmentation Fault\n");
+        return;
+    }
+
+    unsigned long vaddr = (unsigned long)va;
+    /* 仅按页对齐的起始地址释放：要求 va 与 myMalloc 返回值相同含义。 */
+    unsigned long start_vpn = vaddr / PAGE_SIZE;
+    unsigned long n_pages = ((unsigned long)size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    pthread_mutex_lock(&g_vm.vm_lock);
+
+    /* 第一遍：检查所有目标页都已被分配。 */
+    for (unsigned long i = 0; i < n_pages; i++) {
+        unsigned long vpn = start_vpn + i;
+        if (vpn == 0 || vpn >= g_vm.num_v_pages || !get_bit(g_vm.virt_bitmap, vpn)) {
+            pthread_mutex_unlock(&g_vm.vm_lock);
+            printf("Segmentation Fault\n");
+            return;
+        }
+    }
+
+    /* 第二遍：执行释放——清 PTE、清物理位图、清虚拟位图、失效 TLB。 */
+    for (unsigned long i = 0; i < n_pages; i++) {
+        unsigned long vpn = start_vpn + i;
+        unsigned long pa = clear_pte_locked(g_vm.page_dir, vpn * PAGE_SIZE);
+        if (pa != 0) {
+            free_phys_page_locked(pa / PAGE_SIZE);
+        }
+        clear_bit(g_vm.virt_bitmap, vpn);
+        invalidateTLBEntry(vpn);
+    }
+
+    pthread_mutex_unlock(&g_vm.vm_lock);
 }
 
 

@@ -3,6 +3,7 @@
 // Date:	April 2025
 
 #include "my_pthread_t.h"
+#include <errno.h>
 
 /* ============================================================
  *                      全局变量与数据结构
@@ -15,19 +16,46 @@ static schedPolicy g_policy = POLICY_MLFQ;
 static schedPolicy g_policy = POLICY_PSJF;
 #endif
 
-static int           g_initialized = 0;        // 库是否已初始化
-static my_pthread_t  g_next_tid    = 0;        // 下一个分配的线程ID
-static tcb          *g_current     = NULL;     // 当前运行的线程
+static int           g_initialized   = 0;       // 库是否已初始化
+static int           g_timer_started = 0;       // 时钟中断是否已启动
+static my_pthread_t  g_next_tid      = 0;       // 下一个分配的线程ID
+static tcb          *g_current       = NULL;    // 当前运行的线程
 static tcb          *g_threads[MAX_THREADS] = {0}; // 线程ID -> tcb 映射
-static ucontext_t    g_sched_ctx;              // 调度器上下文
-static char          g_sched_stack[STACK_SIZE]; // 调度器栈
-static threadQueue   g_ready;                  // 就绪队列（RR/PSJF 使用）
+
+/* 调度器自己的上下文与栈 —— 信号处理器与同步切换都通过它完成 */
+static ucontext_t    g_sched_ctx;
+static char          g_sched_stack[STACK_SIZE];
+
+/* PSJF / RR 使用的就绪队列 */
+static threadQueue   g_ready;
+
+/* MLFQ 多级队列（Step 4 用） */
+static threadQueue   g_mlfq_queues[MLFQ_LEVELS];
+
+/* ============================================================
+ *                      信号屏蔽辅助
+ * ============================================================ */
+
+/* 屏蔽 SIGVTALRM 进入临界区 */
+static void disable_preempt() {
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGVTALRM);
+	sigprocmask(SIG_BLOCK, &set, NULL);
+}
+
+/* 解除 SIGVTALRM 屏蔽 */
+static void enable_preempt() {
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGVTALRM);
+	sigprocmask(SIG_UNBLOCK, &set, NULL);
+}
 
 /* ============================================================
  *                      队列辅助函数
  * ============================================================ */
 
-/* 将一个 tcb 节点入队到队尾 */
 static void queue_push(threadQueue *q, tcb *t) {
 	t->next = NULL;
 	if (q->tail == NULL) {
@@ -38,7 +66,6 @@ static void queue_push(threadQueue *q, tcb *t) {
 	}
 }
 
-/* 从队首弹出一个 tcb，队列空则返回 NULL */
 static tcb *queue_pop(threadQueue *q) {
 	if (q->head == NULL) return NULL;
 	tcb *t = q->head;
@@ -49,35 +76,149 @@ static tcb *queue_pop(threadQueue *q) {
 }
 
 /* ============================================================
- *                      调度器
+ *                      调度策略
  * ============================================================ */
 
-/* 选择下一个要运行的线程（FCFS / RR：直接取队首） */
+/* PSJF：从 g_ready 中取出 time_slices 最小的线程（O(n)） */
+static tcb *pick_psjf() {
+	if (g_ready.head == NULL) return NULL;
+	tcb *prev = NULL, *p = g_ready.head;
+	tcb *min_prev = NULL, *min = g_ready.head;
+	while (p) {
+		if (p->time_slices < min->time_slices) {
+			min = p;
+			min_prev = prev;
+		}
+		prev = p;
+		p = p->next;
+	}
+	if (min_prev == NULL) g_ready.head = min->next;
+	else min_prev->next = min->next;
+	if (g_ready.tail == min) g_ready.tail = min_prev;
+	min->next = NULL;
+	return min;
+}
+
+/* MLFQ：从最高优先级（0 级）开始查找非空队列并弹出队首 */
+static tcb *pick_mlfq() {
+	for (int i = 0; i < MLFQ_LEVELS; i++) {
+		if (g_mlfq_queues[i].head != NULL) {
+			return queue_pop(&g_mlfq_queues[i]);
+		}
+	}
+	return NULL;
+}
+
+/* 把线程加入合适的就绪队列（取决于策略） */
+static void enqueue_ready(tcb *t) {
+	if (g_policy == POLICY_MLFQ) {
+		if (t->priority < 0) t->priority = 0;
+		if (t->priority >= MLFQ_LEVELS) t->priority = MLFQ_LEVELS - 1;
+		queue_push(&g_mlfq_queues[t->priority], t);
+	} else {
+		queue_push(&g_ready, t);
+	}
+}
+
+/* 选择下一个要运行的线程 */
 static tcb *pick_next() {
+	if (g_policy == POLICY_MLFQ) return pick_mlfq();
+	if (g_policy == POLICY_PSJF) return pick_psjf();
 	return queue_pop(&g_ready);
 }
 
-/* 调度器主循环：从队列中取出下一个线程并切换过去 */
-static void schedule() {
+/* ============================================================
+ *                      调度器主体
+ * ============================================================ */
+
+/* 调度器入口：每次进入时选择下一个线程并切到它的上下文。
+ * 调度器以 makecontext 创建在独立栈 g_sched_stack 上。 */
+static void schedule_loop() {
 	while (1) {
 		tcb *next = pick_next();
 		if (next == NULL) {
-			/* 没有可运行线程，正常情况下不应发生 */
-			return;
+			/* 没有可调度线程：通常因为所有线程都已结束，进程退出 */
+			exit(0);
 		}
 		next->status = RUNNING;
 		g_current = next;
 		setcontext(&next->ctx);
-		/* setcontext 不返回，下次回到 schedule 是通过 swapcontext */
+		/* setcontext 不返回；下次回到 schedule_loop 是通过 swapcontext */
 	}
 }
 
 /* ============================================================
- *                      线程包装与初始化
+ *                      时钟中断处理
  * ============================================================ */
 
-/* 线程入口包装函数：调用真正的入口函数后自动调用 my_pthread_exit */
+/* SIGVTALRM 处理器：每个时间片触发一次
+ * 把当前线程放回就绪队列，切到调度器栈让它选下一个。 */
+static void timer_handler(int sig) {
+	(void)sig;
+	if (g_current == NULL) return;
+
+	g_current->time_slices++;
+
+	/* MLFQ：用完一个时间片后降级（除非已在最低级） */
+	if (g_policy == POLICY_MLFQ && g_current->priority < MLFQ_LEVELS - 1) {
+		g_current->priority++;
+	}
+
+	g_current->status = READY;
+	enqueue_ready(g_current);
+
+	/* 切到调度器；调度器选下一个线程后再 setcontext 切到它 */
+	tcb *self = g_current;
+	swapcontext(&self->ctx, &g_sched_ctx);
+}
+
+/* 启动周期性时钟中断 */
+static void start_timer() {
+	if (g_timer_started) return;
+	g_timer_started = 1;
+
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = timer_handler;
+	sa.sa_flags   = SA_RESTART;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGVTALRM, &sa, NULL);
+
+	struct itimerval it;
+	it.it_interval.tv_sec  = 0;
+	it.it_interval.tv_usec = TIME_QUANTUM_MS * 1000;
+	it.it_value.tv_sec     = 0;
+	it.it_value.tv_usec    = TIME_QUANTUM_MS * 1000;
+	setitimer(ITIMER_VIRTUAL, &it, NULL);
+}
+
+/* ============================================================
+ *                      库初始化与线程包装
+ * ============================================================ */
+
+/* 库初始化：注册主线程为 tid=0 的 tcb，准备调度器上下文 */
+static void library_init() {
+	if (g_initialized) return;
+	g_initialized = 1;
+
+	tcb *main_tcb = (tcb *)calloc(1, sizeof(tcb));
+	main_tcb->tid    = g_next_tid++;
+	main_tcb->status = RUNNING;
+	main_tcb->stack  = NULL;
+	main_tcb->priority = 0;
+	g_threads[main_tcb->tid] = main_tcb;
+	g_current = main_tcb;
+
+	getcontext(&g_sched_ctx);
+	g_sched_ctx.uc_stack.ss_sp   = g_sched_stack;
+	g_sched_ctx.uc_stack.ss_size = STACK_SIZE;
+	g_sched_ctx.uc_link          = NULL;
+	makecontext(&g_sched_ctx, schedule_loop, 0);
+}
+
+/* 线程入口包装：调用真实入口函数后自动 my_pthread_exit */
 static void thread_wrapper() {
+	enable_preempt(); /* 用户代码运行时允许抢占 */
 	tcb *self = g_current;
 	void *ret = NULL;
 	if (self->function) {
@@ -86,48 +227,29 @@ static void thread_wrapper() {
 	my_pthread_exit(ret);
 }
 
-/* 初始化线程库：把当前主线程注册为 tid=0 的线程，准备调度器上下文 */
-static void library_init() {
-	if (g_initialized) return;
-	g_initialized = 1;
-
-	/* 主线程 TCB */
-	tcb *main_tcb = (tcb *)calloc(1, sizeof(tcb));
-	main_tcb->tid    = g_next_tid++;
-	main_tcb->status = RUNNING;
-	main_tcb->stack  = NULL;          // 主线程使用进程默认栈
-	g_threads[main_tcb->tid] = main_tcb;
-	g_current = main_tcb;
-
-	/* 调度器上下文 */
-	getcontext(&g_sched_ctx);
-	g_sched_ctx.uc_stack.ss_sp   = g_sched_stack;
-	g_sched_ctx.uc_stack.ss_size = STACK_SIZE;
-	g_sched_ctx.uc_link          = NULL;
-	makecontext(&g_sched_ctx, schedule, 0);
-}
-
 /* ============================================================
  *                      公共 API
  * ============================================================ */
 
-/* 创建一个新线程：分配 TCB 与栈，初始化上下文，加入就绪队列 */
+/* 创建线程：分配 TCB 与栈，初始化上下文，加入就绪队列 */
 int my_pthread_create(my_pthread_t * thread, pthread_attr_t * attr,
                       void *(*function)(void*), void * arg) {
 	(void)attr;
 	if (!g_initialized) library_init();
+	disable_preempt();
 
-	if (g_next_tid >= MAX_THREADS) return -1;
+	if (g_next_tid >= MAX_THREADS) { enable_preempt(); return -1; }
 
 	tcb *t = (tcb *)calloc(1, sizeof(tcb));
-	if (!t) return -1;
+	if (!t) { enable_preempt(); return -1; }
 
 	t->tid       = g_next_tid++;
 	t->status    = READY;
 	t->function  = function;
 	t->arg       = arg;
+	t->priority  = 0;
 	t->stack     = malloc(STACK_SIZE);
-	if (!t->stack) { free(t); return -1; }
+	if (!t->stack) { free(t); enable_preempt(); return -1; }
 
 	getcontext(&t->ctx);
 	t->ctx.uc_stack.ss_sp   = t->stack;
@@ -136,65 +258,70 @@ int my_pthread_create(my_pthread_t * thread, pthread_attr_t * attr,
 	makecontext(&t->ctx, thread_wrapper, 0);
 
 	g_threads[t->tid] = t;
-	queue_push(&g_ready, t);
+	enqueue_ready(t);
 
 	if (thread) *thread = t->tid;
+
+	if (!g_timer_started) start_timer();
+	enable_preempt();
 	return 0;
 }
 
-/* 主动让出 CPU：把当前线程放回就绪队列，切换到调度器 */
+/* 主动让出 CPU：把自己放回就绪队列，切到调度器 */
 int my_pthread_yield() {
 	if (!g_initialized) library_init();
+	disable_preempt();
 	tcb *self = g_current;
 	self->status = READY;
-	queue_push(&g_ready, self);
+	enqueue_ready(self);
 	swapcontext(&self->ctx, &g_sched_ctx);
+	enable_preempt();
 	return 0;
 }
 
-/* 终止当前线程：保存返回值，唤醒 join 者，切换到调度器 */
+/* 终止当前线程：保存返回值，唤醒 join 者，跳到调度器 */
 void my_pthread_exit(void *value_ptr) {
+	disable_preempt();
 	tcb *self = g_current;
 	self->retval = value_ptr;
 	self->status = FINISHED;
-	/* 若有线程在 join 此线程，把它放回就绪队列 */
 	if (self->joiner) {
 		self->joiner->status = READY;
-		queue_push(&g_ready, self->joiner);
+		enqueue_ready(self->joiner);
 		self->joiner = NULL;
 	}
 	setcontext(&g_sched_ctx);
 	/* 不返回 */
 }
 
-/* 阻塞等待目标线程结束，并取出其返回值 */
+/* 阻塞等待目标线程结束 */
 int my_pthread_join(my_pthread_t thread, void **value_ptr) {
 	if (!g_initialized) library_init();
-	if (thread >= MAX_THREADS) return -1;
+	disable_preempt();
+
+	if (thread >= MAX_THREADS) { enable_preempt(); return -1; }
 	tcb *target = g_threads[thread];
-	if (!target) return -1;
-	if (target == g_current) return -1; /* 不能 join 自己 */
+	if (!target || target == g_current) { enable_preempt(); return -1; }
 
 	if (target->status != FINISHED) {
-		/* 目标线程还没结束，把自己挂到 target->joiner 上并阻塞 */
-		if (target->joiner != NULL) return -1; /* 已被其他线程 join */
+		if (target->joiner != NULL) { enable_preempt(); return -1; }
 		target->joiner = g_current;
-		g_current->status = BLOCKED;
-		swapcontext(&g_current->ctx, &g_sched_ctx);
+		tcb *self = g_current;
+		self->status = BLOCKED;
+		swapcontext(&self->ctx, &g_sched_ctx);
+		/* 被唤醒后此处继续 */
 	}
 
-	/* 此时 target 已经结束 */
 	if (value_ptr) *value_ptr = target->retval;
-
-	/* 释放被 join 线程的资源 */
 	if (target->stack) free(target->stack);
 	g_threads[target->tid] = NULL;
 	free(target);
+	enable_preempt();
 	return 0;
 }
 
 /* ============================================================
- *                      互斥锁（Step 2 实现）
+ *                      互斥锁
  * ============================================================ */
 
 int my_pthread_mutex_init(my_pthread_mutex_t *mutex,
@@ -209,15 +336,20 @@ int my_pthread_mutex_init(my_pthread_mutex_t *mutex,
 	return 0;
 }
 
-/* 获取互斥锁：用 GCC 内建的 test-and-set 实现原子获取
- * 若锁已被占用，把当前线程加入到该锁的等待队列并阻塞，切换到调度器。 */
+/* 获取互斥锁：使用 GCC 内建 test-and-set 原子获取
+ * 若锁被占用，把当前线程加入互斥锁等待队列并阻塞 */
 int my_pthread_mutex_lock(my_pthread_mutex_t *mutex) {
 	if (!mutex || !mutex->initialized) return -1;
 	if (!g_initialized) library_init();
 
-	/* 尝试原子地把 locked 从 0 置为 1 */
-	while (__sync_lock_test_and_set(&mutex->locked, 1) == 1) {
-		/* 锁已被占用，把自己加入等待队列并阻塞 */
+	while (1) {
+		disable_preempt();
+		if (__sync_lock_test_and_set(&mutex->locked, 1) == 0) {
+			mutex->owner = g_current;
+			enable_preempt();
+			return 0;
+		}
+		/* 锁已占用：把自己挂到等待队列并阻塞，切到调度器 */
 		tcb *self = g_current;
 		self->next = NULL;
 		if (mutex->wait_tail == NULL) {
@@ -228,36 +360,36 @@ int my_pthread_mutex_lock(my_pthread_mutex_t *mutex) {
 		}
 		self->status = BLOCKED;
 		swapcontext(&self->ctx, &g_sched_ctx);
-		/* 被 unlock 唤醒后，重新尝试获取锁 */
+		enable_preempt();
+		/* 被 unlock 唤醒后回到循环首部，重新尝试获取 */
 	}
-	mutex->owner = g_current;
-	return 0;
 }
 
-/* 释放互斥锁：清除占用标志，把等待队列中第一个线程移回就绪队列 */
+/* 释放互斥锁：清 locked，唤醒等待队列首部线程 */
 int my_pthread_mutex_unlock(my_pthread_mutex_t *mutex) {
 	if (!mutex || !mutex->initialized) return -1;
-	if (mutex->owner != g_current) return -1; /* 仅持有者可以解锁 */
+	disable_preempt();
+	if (mutex->owner != g_current) { enable_preempt(); return -1; }
 
 	mutex->owner = NULL;
 	__sync_lock_release(&mutex->locked);
 
-	/* 唤醒等待队列首部线程（如有） */
 	if (mutex->wait_head != NULL) {
 		tcb *t = mutex->wait_head;
 		mutex->wait_head = t->next;
 		if (mutex->wait_head == NULL) mutex->wait_tail = NULL;
 		t->next = NULL;
 		t->status = READY;
-		queue_push(&g_ready, t);
+		enqueue_ready(t);
 	}
+	enable_preempt();
 	return 0;
 }
 
 /* 销毁互斥锁：要求锁未被占用且无等待者 */
 int my_pthread_mutex_destroy(my_pthread_mutex_t *mutex) {
 	if (!mutex) return -1;
-	if (mutex->locked || mutex->wait_head) return -1; /* 锁被占用或仍有等待者 */
+	if (mutex->locked || mutex->wait_head) return -1;
 	mutex->initialized = 0;
 	return 0;
 }

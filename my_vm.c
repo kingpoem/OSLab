@@ -13,6 +13,8 @@ typedef struct {
     char *virt_bitmap;              // 虚拟页位图（每页 1 位）
     char *phys_bitmap;              // 物理页位图（每页 1 位）
     char *disk_bitmap;              // 磁盘页位图（每页 1 位）
+    long *ppn_to_vpn;               // 反向映射：物理页号 → 虚拟页号；-1 空闲，-2 用作页表
+    long *vpn_to_disk;              // 虚拟页 → 磁盘页号（被换出时）；-1 表示未在磁盘
     unsigned long num_v_pages;      // 虚拟页总数
     unsigned long num_p_pages;      // 物理页总数
     unsigned long num_d_pages;      // 磁盘页总数
@@ -107,12 +109,36 @@ static long alloc_phys_page_locked() {
 }
 
 /*
- * 释放给定物理页号占用的物理页（清除位图位）。
+ * 释放给定物理页号占用的物理页（清除位图位与反向映射）。
  * 调用方需自行持有 vm_lock。
  */
 static void free_phys_page_locked(unsigned long ppn) {
     if (ppn < g_vm.num_p_pages) {
         clear_bit(g_vm.phys_bitmap, ppn);
+        g_vm.ppn_to_vpn[ppn] = -1;
+    }
+}
+
+/*
+ * 在磁盘位图中查找一个空闲磁盘页，返回页号；找不到返回 -1。
+ * 调用方需自行持有 vm_lock。
+ */
+static long alloc_disk_page_locked() {
+    for (unsigned long i = 0; i < g_vm.num_d_pages; i++) {
+        if (!get_bit(g_vm.disk_bitmap, i)) {
+            set_bit(g_vm.disk_bitmap, i);
+            return (long)i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * 释放给定磁盘页号。调用方需自行持有 vm_lock。
+ */
+static void free_disk_page_locked(unsigned long dpn) {
+    if (dpn < g_vm.num_d_pages) {
+        clear_bit(g_vm.disk_bitmap, dpn);
     }
 }
 
@@ -167,6 +193,10 @@ static int validate_range_locked(unsigned long vaddr, unsigned long size) {
     }
     return 1;
 }
+
+/* 前向声明：换出/带换出的物理页分配，定义在文件后部。 */
+static long evict_one_locked(void);
+static long alloc_phys_page_with_evict_locked(void);
 
 /*
  * 在 TLB 中查找并使包含 vpn 的条目失效。
@@ -230,15 +260,23 @@ void initMemoryAndDisk() {
     g_vm.virt_bitmap = (char *)calloc(1, vbm_bytes);
     g_vm.phys_bitmap = (char *)calloc(1, pbm_bytes);
     g_vm.disk_bitmap = (char *)calloc(1, dbm_bytes);
-    if (!g_vm.virt_bitmap || !g_vm.phys_bitmap || !g_vm.disk_bitmap) {
-        fprintf(stderr, "initMemoryAndDisk: failed to allocate bitmaps\n");
+    g_vm.ppn_to_vpn = (long *)malloc(sizeof(long) * g_vm.num_p_pages);
+    g_vm.vpn_to_disk = (long *)malloc(sizeof(long) * g_vm.num_v_pages);
+    if (!g_vm.virt_bitmap || !g_vm.phys_bitmap || !g_vm.disk_bitmap
+        || !g_vm.ppn_to_vpn || !g_vm.vpn_to_disk) {
+        fprintf(stderr, "initMemoryAndDisk: failed to allocate bitmaps/maps\n");
+        pthread_mutex_unlock(&g_init_lock);
+        return;
     }
+    for (unsigned long i = 0; i < g_vm.num_p_pages; i++) g_vm.ppn_to_vpn[i] = -1;
+    for (unsigned long i = 0; i < g_vm.num_v_pages; i++) g_vm.vpn_to_disk[i] = -1;
 
     /* 一级页目录占用一个物理页：将物理页 0 保留给页目录使用，
      * 这样虚拟地址 0 就不会被分配（与 NULL 区分），同时也方便 PDE/PTE 用 0 表示“未映射”。 */
     g_vm.page_dir = (pde_t *)g_vm.phys_mem;
     memset(g_vm.page_dir, 0, PAGE_SIZE);
     set_bit(g_vm.phys_bitmap, 0);
+    g_vm.ppn_to_vpn[0] = -2;  // 标记物理页 0 为页目录占用，禁止换出
     /* 同样保留虚拟页 0，防止 myMalloc 返回 NULL（0）。 */
     set_bit(g_vm.virt_bitmap, 0);
 
@@ -275,10 +313,20 @@ pte_t * translate(pde_t *pgdir, void *va) {
     unsigned long off = get_offset(vaddr);
 
     pde_t pde = pgdir[pde_idx];
-    if (pde == 0) return NULL;
+    pte_t *page_table = (pde == 0) ? NULL : (pte_t *)(g_vm.phys_mem + pde);
+    pte_t pte = page_table ? page_table[pte_idx] : 0;
 
-    pte_t *page_table = (pte_t *)(g_vm.phys_mem + pde);
-    pte_t pte = page_table[pte_idx];
+    /* 若 PTE 为 0 但磁盘上有该 vpn 的备份，触发缺页换入。 */
+    if (pte == 0 && pgdir == g_vm.page_dir) {
+        unsigned long vpn = vaddr / PAGE_SIZE;
+        if (vpn < g_vm.num_v_pages && g_vm.vpn_to_disk[vpn] >= 0) {
+            if (pageFault(pgdir, va) == 0) {
+                pde = pgdir[pde_idx];
+                page_table = (pte_t *)(g_vm.phys_mem + pde);
+                pte = page_table[pte_idx];
+            }
+        }
+    }
     if (pte == 0) return NULL;
 
     /* 页表命中，回填 TLB（仅对当前全局页目录）。 */
@@ -306,11 +354,12 @@ pageMap(pde_t *pgdir, void *va, void *pa)
     unsigned long pte_idx = get_pte_idx(vaddr);
 
     if (pgdir[pde_idx] == 0) {
-        long pt_pn = alloc_phys_page_locked();
+        long pt_pn = alloc_phys_page_with_evict_locked();
         if (pt_pn < 0) return -1;
         unsigned long pt_paddr = (unsigned long)pt_pn * PAGE_SIZE;
         memset(g_vm.phys_mem + pt_paddr, 0, PAGE_SIZE);
         pgdir[pde_idx] = (pde_t)pt_paddr;
+        g_vm.ppn_to_vpn[pt_pn] = -2;  // 标记为二级页表，不可被换出
     }
 
     pte_t *page_table = (pte_t *)(g_vm.phys_mem + pgdir[pde_idx]);
@@ -318,17 +367,107 @@ pageMap(pde_t *pgdir, void *va, void *pa)
         return -1;
     }
     page_table[pte_idx] = (pte_t)paddr;
+    /* 维护反向映射：仅对数据页（paddr 对应的物理页号），仅当 pgdir 为全局页目录时。 */
+    if (pgdir == g_vm.page_dir) {
+        unsigned long ppn = paddr / PAGE_SIZE;
+        unsigned long vpn = vaddr / PAGE_SIZE;
+        if (ppn < g_vm.num_p_pages) g_vm.ppn_to_vpn[ppn] = (long)vpn;
+    }
     return 0;
 }
 
 
 /*
- * 处理缺页错误：当物理页耗尽时进行物理页替换并加载新页面。
+ * 选择一个 victim 物理数据页，将其内容写入磁盘并断开原映射，返回该物理页号。
+ * 替换策略：FIFO（用静态 cursor 在合法物理页上轮转）。
+ * 若没有可换出的页（例如物理内存全部被页目录/二级页表占用）则返回 -1。
+ * 调用方需自行持有 vm_lock。
+ */
+static long evict_one_locked() {
+    static unsigned long fifo_ppn_cursor = 0;
+    unsigned long n = g_vm.num_p_pages;
+    if (n == 0) return -1;
+
+    for (unsigned long step = 0; step < n; step++) {
+        unsigned long ppn = (fifo_ppn_cursor + step) % n;
+        long owner_vpn = g_vm.ppn_to_vpn[ppn];
+        if (owner_vpn < 0) continue;  // -1 空闲（不该选） / -2 是页表
+
+        long dpn = alloc_disk_page_locked();
+        if (dpn < 0) return -1;  // 磁盘也满了
+
+        memcpy(g_vm.disk_mem + (unsigned long)dpn * PAGE_SIZE,
+               g_vm.phys_mem + ppn * PAGE_SIZE,
+               PAGE_SIZE);
+
+        unsigned long vaddr = (unsigned long)owner_vpn * PAGE_SIZE;
+        clear_pte_locked(g_vm.page_dir, vaddr);
+        g_vm.vpn_to_disk[owner_vpn] = dpn;
+
+        invalidateTLBEntry((unsigned long)owner_vpn);
+
+        clear_bit(g_vm.phys_bitmap, ppn);
+        g_vm.ppn_to_vpn[ppn] = -1;
+
+        fifo_ppn_cursor = (ppn + 1) % n;
+        return (long)ppn;
+    }
+    return -1;
+}
+
+/*
+ * 分配一个空闲物理页；若无空闲则触发 evict_one_locked 换出一页再分配。
+ * 调用方需自行持有 vm_lock。
+ */
+static long alloc_phys_page_with_evict_locked() {
+    long ppn = alloc_phys_page_locked();
+    if (ppn >= 0) return ppn;
+    long victim = evict_one_locked();
+    if (victim < 0) return -1;
+    set_bit(g_vm.phys_bitmap, (unsigned long)victim);
+    return victim;
+}
+
+/*
+ * 处理缺页错误：将给定虚拟地址对应的页从磁盘换回内存。
+ * 调用前提：va 已分配（virt_bitmap 为 1）但当前 PTE 为 0，且 vpn_to_disk[vpn] >= 0。
+ * 成功返回 0，失败返回 -1。
+ * 调用方需自行持有 vm_lock。
  */
 int pageFault(pde_t *pgdir, void *va) {
-    (void)pgdir;
-    (void)va;
-    return -1;
+    if (!pgdir) return -1;
+    unsigned long vaddr = (unsigned long)va;
+    unsigned long vpn = vaddr / PAGE_SIZE;
+    if (vpn >= g_vm.num_v_pages) return -1;
+
+    long dpn = g_vm.vpn_to_disk[vpn];
+    if (dpn < 0) return -1;  // 不在磁盘上，无法换入
+
+    long ppn = alloc_phys_page_with_evict_locked();
+    if (ppn < 0) return -1;
+
+    memcpy(g_vm.phys_mem + (unsigned long)ppn * PAGE_SIZE,
+           g_vm.disk_mem + (unsigned long)dpn * PAGE_SIZE,
+           PAGE_SIZE);
+
+    free_disk_page_locked((unsigned long)dpn);
+    g_vm.vpn_to_disk[vpn] = -1;
+
+    /* 重建 PTE。 */
+    unsigned long pde_idx = get_pde_idx(vaddr);
+    unsigned long pte_idx = get_pte_idx(vaddr);
+    if (pgdir[pde_idx] == 0) {
+        long pt_pn = alloc_phys_page_with_evict_locked();
+        if (pt_pn < 0) return -1;
+        unsigned long pt_paddr = (unsigned long)pt_pn * PAGE_SIZE;
+        memset(g_vm.phys_mem + pt_paddr, 0, PAGE_SIZE);
+        pgdir[pde_idx] = (pde_t)pt_paddr;
+        g_vm.ppn_to_vpn[pt_pn] = -2;
+    }
+    pte_t *page_table = (pte_t *)(g_vm.phys_mem + pgdir[pde_idx]);
+    page_table[pte_idx] = (pte_t)((unsigned long)ppn * PAGE_SIZE);
+    g_vm.ppn_to_vpn[ppn] = (long)vpn;
+    return 0;
 }
 
 
@@ -439,7 +578,7 @@ void *myMalloc(unsigned int num_bytes) {
 
     int ok = 1;
     for (unsigned long i = 0; i < n_pages; i++) {
-        long ppn = alloc_phys_page_locked();
+        long ppn = alloc_phys_page_with_evict_locked();
         if (ppn < 0) { ok = 0; break; }
         allocated_ppns[i] = (unsigned long)ppn;
         unsigned long vaddr = (unsigned long)(start_vpn + i) * PAGE_SIZE;
@@ -499,12 +638,16 @@ void myFree(void *va, int size) {
         }
     }
 
-    /* 第二遍：执行释放——清 PTE、清物理位图、清虚拟位图、失效 TLB。 */
+    /* 第二遍：执行释放——清 PTE/物理位图、磁盘备份、虚拟位图，失效 TLB。 */
     for (unsigned long i = 0; i < n_pages; i++) {
         unsigned long vpn = start_vpn + i;
         unsigned long pa = clear_pte_locked(g_vm.page_dir, vpn * PAGE_SIZE);
         if (pa != 0) {
             free_phys_page_locked(pa / PAGE_SIZE);
+        }
+        if (g_vm.vpn_to_disk[vpn] >= 0) {
+            free_disk_page_locked((unsigned long)g_vm.vpn_to_disk[vpn]);
+            g_vm.vpn_to_disk[vpn] = -1;
         }
         clear_bit(g_vm.virt_bitmap, vpn);
         invalidateTLBEntry(vpn);

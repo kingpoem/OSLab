@@ -29,8 +29,14 @@ static char          g_sched_stack[STACK_SIZE];
 /* PSJF / RR 使用的就绪队列 */
 static threadQueue   g_ready;
 
-/* MLFQ 多级队列（Step 4 用） */
+/* MLFQ 多级队列：优先级 0 最高，时间片最短 */
 static threadQueue   g_mlfq_queues[MLFQ_LEVELS];
+
+/* MLFQ 各级时间片长度（毫秒）：优先级越低时间片越长 */
+static const int     g_mlfq_quantum_ms[MLFQ_LEVELS] = {5, 10, 20, 40};
+
+/* 累计运行毫秒数，用于周期性优先级提升（防饥饿） */
+static int           g_elapsed_ms = 0;
 
 /* ============================================================
  *                      信号屏蔽辅助
@@ -127,6 +133,38 @@ static tcb *pick_next() {
 	return queue_pop(&g_ready);
 }
 
+/* MLFQ 优先级提升：把所有线程提到最高优先级队列，防止低优先级饥饿 */
+static void mlfq_priority_boost() {
+	if (g_policy != POLICY_MLFQ) return;
+	/* 把 1..N-1 级队列中的所有线程移到 0 级 */
+	for (int i = 1; i < MLFQ_LEVELS; i++) {
+		while (g_mlfq_queues[i].head != NULL) {
+			tcb *t = queue_pop(&g_mlfq_queues[i]);
+			t->priority = 0;
+			queue_push(&g_mlfq_queues[0], t);
+		}
+	}
+	/* 把当前正在运行的线程也提升到 0 级（下一个 enqueue 时生效） */
+	if (g_current) g_current->priority = 0;
+}
+
+/* 根据当前线程的优先级（MLFQ）或固定值（PSJF）启动一次性时钟 */
+static void arm_timer_for(tcb *t) {
+	int ms = TIME_QUANTUM_MS;
+	if (g_policy == POLICY_MLFQ) {
+		int p = t->priority;
+		if (p < 0) p = 0;
+		if (p >= MLFQ_LEVELS) p = MLFQ_LEVELS - 1;
+		ms = g_mlfq_quantum_ms[p];
+	}
+	struct itimerval it;
+	it.it_interval.tv_sec  = 0;
+	it.it_interval.tv_usec = 0;        /* 单次模式，由调度器每次重置 */
+	it.it_value.tv_sec     = 0;
+	it.it_value.tv_usec    = ms * 1000;
+	setitimer(ITIMER_VIRTUAL, &it, NULL);
+}
+
 /* ============================================================
  *                      调度器主体
  * ============================================================ */
@@ -135,15 +173,22 @@ static tcb *pick_next() {
  * 调度器以 makecontext 创建在独立栈 g_sched_stack 上。 */
 static void schedule_loop() {
 	while (1) {
+		/* MLFQ：检查是否需要周期性提升优先级 */
+		if (g_policy == POLICY_MLFQ && g_elapsed_ms >= MLFQ_BOOST_PERIOD) {
+			g_elapsed_ms = 0;
+			mlfq_priority_boost();
+		}
+
 		tcb *next = pick_next();
 		if (next == NULL) {
-			/* 没有可调度线程：通常因为所有线程都已结束，进程退出 */
+			/* 没有可调度线程：所有线程都已结束 */
 			exit(0);
 		}
 		next->status = RUNNING;
 		g_current = next;
+		arm_timer_for(next);
 		setcontext(&next->ctx);
-		/* setcontext 不返回；下次回到 schedule_loop 是通过 swapcontext */
+		/* setcontext 不返回；下次回到 schedule_loop 通过 swapcontext */
 	}
 }
 
@@ -151,28 +196,30 @@ static void schedule_loop() {
  *                      时钟中断处理
  * ============================================================ */
 
-/* SIGVTALRM 处理器：每个时间片触发一次
- * 把当前线程放回就绪队列，切到调度器栈让它选下一个。 */
+/* SIGVTALRM 处理器：当前线程的时间片用完时触发
+ * 把当前线程放回就绪队列（MLFQ 下降级），切到调度器栈让它选下一个。 */
 static void timer_handler(int sig) {
 	(void)sig;
 	if (g_current == NULL) return;
 
 	g_current->time_slices++;
 
-	/* MLFQ：用完一个时间片后降级（除非已在最低级） */
-	if (g_policy == POLICY_MLFQ && g_current->priority < MLFQ_LEVELS - 1) {
-		g_current->priority++;
+	/* MLFQ：用完一个时间片后降级；同时累计经过时间用于优先级提升 */
+	if (g_policy == POLICY_MLFQ) {
+		g_elapsed_ms += g_mlfq_quantum_ms[g_current->priority];
+		if (g_current->priority < MLFQ_LEVELS - 1) {
+			g_current->priority++;
+		}
 	}
 
 	g_current->status = READY;
 	enqueue_ready(g_current);
 
-	/* 切到调度器；调度器选下一个线程后再 setcontext 切到它 */
 	tcb *self = g_current;
 	swapcontext(&self->ctx, &g_sched_ctx);
 }
 
-/* 启动周期性时钟中断 */
+/* 启动时钟中断（仅注册 sigaction，具体的 itimer 由调度器逐次设置） */
 static void start_timer() {
 	if (g_timer_started) return;
 	g_timer_started = 1;
@@ -184,12 +231,7 @@ static void start_timer() {
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGVTALRM, &sa, NULL);
 
-	struct itimerval it;
-	it.it_interval.tv_sec  = 0;
-	it.it_interval.tv_usec = TIME_QUANTUM_MS * 1000;
-	it.it_value.tv_sec     = 0;
-	it.it_value.tv_usec    = TIME_QUANTUM_MS * 1000;
-	setitimer(ITIMER_VIRTUAL, &it, NULL);
+	/* 由 schedule_loop 在每次切换时通过 arm_timer_for 设置具体值 */
 }
 
 /* ============================================================
@@ -262,7 +304,11 @@ int my_pthread_create(my_pthread_t * thread, pthread_attr_t * attr,
 
 	if (thread) *thread = t->tid;
 
-	if (!g_timer_started) start_timer();
+	if (!g_timer_started) {
+		start_timer();
+		/* 给当前（主）线程也 arm 一次时钟，否则它会一直霸占 CPU */
+		arm_timer_for(g_current);
+	}
 	enable_preempt();
 	return 0;
 }

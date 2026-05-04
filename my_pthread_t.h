@@ -24,10 +24,11 @@
 
 /* defile necessary MACRO here, for example, thread upper bound,
    stack size, priority queue levels, time quantum, etc. */
-#define STACK_SIZE       (64 * 1024)   // 每个线程栈大小：64KB
-#define MAX_THREADS      256           // 系统最多可创建的线程数（含主线程）
-#define TIME_QUANTUM_MS  10            // 时间片长度（毫秒）
-#define MLFQ_LEVELS      4             // MLFQ 优先级队列级数
+#define STACK_SIZE          (64 * 1024)  // 每个线程栈大小：64KB
+#define MAX_THREADS         256          // 最多创建的线程数（含主线程）
+#define TIME_QUANTUM_MS     10           // PSJF 默认时间片（毫秒）
+#define MLFQ_LEVELS         4            // MLFQ 优先级队列级数（0 最高）
+#define MLFQ_BOOST_PERIOD   200          // 每经过这么多 ms 把所有线程提升回顶级队列
 
 typedef unsigned int my_pthread_t;
 

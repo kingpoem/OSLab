@@ -30,12 +30,12 @@ typedef unsigned long pte_t;
 // TLB data structure example. Feel free to modify
 typedef struct {
 	struct {
-		bool valid;  // valid bit
-		unsigned long v_page;  // virtual page number
-		unsigned long p_page;  // physical page number
+		bool valid;             // 该 TLB 项是否有效
+		unsigned long v_page;   // 虚拟页号
+		unsigned long p_page;   // 物理页号
 	} entry[TLB_SIZE];
-    unsigned int tlb_accesses;
-    unsigned int tlb_misses;
+	unsigned int tlb_accesses;  // 累计访问次数
+	unsigned int tlb_misses;    // 累计缺失次数
 } TLB;
 
 void initMemoryAndDisk();
@@ -44,6 +44,7 @@ int pageMap(pde_t *pgdir, void *va, void* pa);
 int pageFault(pde_t *pgdir, void *va);
 pte_t *checkTLB(void *va);
 int addTLB(void *va, void *pa);
+void printTLBStats();
 
 void myFree(void *va, int size);
 void *myMalloc(unsigned int num_bytes);

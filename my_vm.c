@@ -70,6 +70,54 @@ static int get_bit(const char *bitmap, unsigned long index) {
 
 
 /*
+ * 从虚拟地址中提取一级页表索引（高位 pde_bits 位）。
+ */
+static unsigned long get_pde_idx(unsigned long va) {
+    return va >> (g_vm.pte_bits + g_vm.offset_bits);
+}
+
+/*
+ * 从虚拟地址中提取二级页表索引（中间 pte_bits 位）。
+ */
+static unsigned long get_pte_idx(unsigned long va) {
+    return (va >> g_vm.offset_bits) & ((1UL << g_vm.pte_bits) - 1);
+}
+
+/*
+ * 从虚拟地址中提取页内偏移（低 offset_bits 位）。
+ */
+static unsigned long get_offset(unsigned long va) {
+    return va & ((1UL << g_vm.offset_bits) - 1);
+}
+
+
+/*
+ * 在物理位图中查找第一个空闲物理页并标记占用，返回物理页号。
+ * 若没有空闲物理页则返回 -1。
+ * 调用方需自行持有 vm_lock。
+ */
+static long alloc_phys_page_locked() {
+    for (unsigned long i = 0; i < g_vm.num_p_pages; i++) {
+        if (!get_bit(g_vm.phys_bitmap, i)) {
+            set_bit(g_vm.phys_bitmap, i);
+            return (long)i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * 释放给定物理页号占用的物理页（清除位图位）。
+ * 调用方需自行持有 vm_lock。
+ */
+static void free_phys_page_locked(unsigned long ppn) {
+    if (ppn < g_vm.num_p_pages) {
+        clear_bit(g_vm.phys_bitmap, ppn);
+    }
+}
+
+
+/*
  * 负责分配并设置模拟的物理内存与磁盘空间。
  * 同时计算物理/虚拟页数并初始化对应位图。
  * 该函数仅在首次调用时真正执行初始化，多线程下采用互斥锁保护。
@@ -141,27 +189,57 @@ void initMemoryAndDisk() {
 
 
 /*
- * 根据一级页表基地址和虚拟地址进行地址翻译，返回指向对应 PTE 的指针。
- * 若该虚拟地址不存在有效映射则返回 NULL。
+ * 根据一级页表基地址和虚拟地址进行地址翻译。
+ * 返回指向 phys_mem 中对应字节位置的指针（host 指针），调用者可直接读写。
+ * 若虚拟地址未建立有效映射则返回 NULL。
  */
 pte_t * translate(pde_t *pgdir, void *va) {
-    (void)pgdir;
-    (void)va;
-    return NULL;
+    if (!pgdir) return NULL;
+    unsigned long vaddr = (unsigned long)va;
+    unsigned long pde_idx = get_pde_idx(vaddr);
+    unsigned long pte_idx = get_pte_idx(vaddr);
+    unsigned long off = get_offset(vaddr);
+
+    pde_t pde = pgdir[pde_idx];
+    if (pde == 0) return NULL;
+
+    pte_t *page_table = (pte_t *)(g_vm.phys_mem + pde);
+    pte_t pte = page_table[pte_idx];
+    if (pte == 0) return NULL;
+
+    return (pte_t *)(g_vm.phys_mem + pte + off);
 }
 
 
 /*
- * 在页目录中检查给定虚拟地址是否已存在映射；若不存在则添加新的页表项。
- * 该函数将在 myMalloc() 中被调用以建立虚拟页到物理页的映射。
+ * 在给定页目录中为虚拟地址 va 建立到物理地址 pa 的映射（pa 为 phys_mem 内的偏移）。
+ * 若一级页目录项尚未指向二级页表，则分配一个新物理页用作二级页表。
+ * 若 va 已存在映射或资源耗尽则返回 -1，成功返回 0。
+ * 调用方需自行持有 vm_lock。
  */
 int
 pageMap(pde_t *pgdir, void *va, void *pa)
 {
-    (void)pgdir;
-    (void)va;
-    (void)pa;
-    return -1;
+    if (!pgdir) return -1;
+    unsigned long vaddr = (unsigned long)va;
+    unsigned long paddr = (unsigned long)pa;
+    unsigned long pde_idx = get_pde_idx(vaddr);
+    unsigned long pte_idx = get_pte_idx(vaddr);
+
+    if (pgdir[pde_idx] == 0) {
+        long pt_pn = alloc_phys_page_locked();
+        if (pt_pn < 0) return -1;
+        unsigned long pt_paddr = (unsigned long)pt_pn * PAGE_SIZE;
+        memset(g_vm.phys_mem + pt_paddr, 0, PAGE_SIZE);
+        pgdir[pde_idx] = (pde_t)pt_paddr;
+    }
+
+    pte_t *page_table = (pte_t *)(g_vm.phys_mem + pgdir[pde_idx]);
+    if (page_table[pte_idx] != 0) {
+        return -1;
+    }
+    page_table[pte_idx] = (pte_t)paddr;
+    return 0;
 }
 
 

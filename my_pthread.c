@@ -209,18 +209,55 @@ int my_pthread_mutex_init(my_pthread_mutex_t *mutex,
 	return 0;
 }
 
+/* 获取互斥锁：用 GCC 内建的 test-and-set 实现原子获取
+ * 若锁已被占用，把当前线程加入到该锁的等待队列并阻塞，切换到调度器。 */
 int my_pthread_mutex_lock(my_pthread_mutex_t *mutex) {
-	(void)mutex;
+	if (!mutex || !mutex->initialized) return -1;
+	if (!g_initialized) library_init();
+
+	/* 尝试原子地把 locked 从 0 置为 1 */
+	while (__sync_lock_test_and_set(&mutex->locked, 1) == 1) {
+		/* 锁已被占用，把自己加入等待队列并阻塞 */
+		tcb *self = g_current;
+		self->next = NULL;
+		if (mutex->wait_tail == NULL) {
+			mutex->wait_head = mutex->wait_tail = self;
+		} else {
+			mutex->wait_tail->next = self;
+			mutex->wait_tail = self;
+		}
+		self->status = BLOCKED;
+		swapcontext(&self->ctx, &g_sched_ctx);
+		/* 被 unlock 唤醒后，重新尝试获取锁 */
+	}
+	mutex->owner = g_current;
 	return 0;
 }
 
+/* 释放互斥锁：清除占用标志，把等待队列中第一个线程移回就绪队列 */
 int my_pthread_mutex_unlock(my_pthread_mutex_t *mutex) {
-	(void)mutex;
+	if (!mutex || !mutex->initialized) return -1;
+	if (mutex->owner != g_current) return -1; /* 仅持有者可以解锁 */
+
+	mutex->owner = NULL;
+	__sync_lock_release(&mutex->locked);
+
+	/* 唤醒等待队列首部线程（如有） */
+	if (mutex->wait_head != NULL) {
+		tcb *t = mutex->wait_head;
+		mutex->wait_head = t->next;
+		if (mutex->wait_head == NULL) mutex->wait_tail = NULL;
+		t->next = NULL;
+		t->status = READY;
+		queue_push(&g_ready, t);
+	}
 	return 0;
 }
 
+/* 销毁互斥锁：要求锁未被占用且无等待者 */
 int my_pthread_mutex_destroy(my_pthread_mutex_t *mutex) {
 	if (!mutex) return -1;
+	if (mutex->locked || mutex->wait_head) return -1; /* 锁被占用或仍有等待者 */
 	mutex->initialized = 0;
 	return 0;
 }

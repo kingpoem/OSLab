@@ -256,11 +256,19 @@ void initMemoryAndDisk() {
 
 /*
  * 根据一级页表基地址和虚拟地址进行地址翻译。
- * 返回指向 phys_mem 中对应字节位置的指针（host 指针），调用者可直接读写。
+ * 流程：先查 TLB；若命中则直接返回；缺失则走两级页表，命中后回填 TLB。
+ * 返回指向 phys_mem 中对应字节位置的指针（host 指针），可直接读写。
  * 若虚拟地址未建立有效映射则返回 NULL。
  */
 pte_t * translate(pde_t *pgdir, void *va) {
     if (!pgdir) return NULL;
+
+    /* 仅当 pgdir 是当前全局页目录时使用 TLB（TLB 与 page_dir 绑定）。 */
+    if (pgdir == g_vm.page_dir) {
+        pte_t *cached = checkTLB(va);
+        if (cached) return cached;
+    }
+
     unsigned long vaddr = (unsigned long)va;
     unsigned long pde_idx = get_pde_idx(vaddr);
     unsigned long pte_idx = get_pte_idx(vaddr);
@@ -272,6 +280,11 @@ pte_t * translate(pde_t *pgdir, void *va) {
     pte_t *page_table = (pte_t *)(g_vm.phys_mem + pde);
     pte_t pte = page_table[pte_idx];
     if (pte == 0) return NULL;
+
+    /* 页表命中，回填 TLB（仅对当前全局页目录）。 */
+    if (pgdir == g_vm.page_dir) {
+        addTLB(va, (void *)(unsigned long)pte);
+    }
 
     return (pte_t *)(g_vm.phys_mem + pte + off);
 }
@@ -320,26 +333,71 @@ int pageFault(pde_t *pgdir, void *va) {
 
 
 /*
- * 在 TLB 中查找虚拟地址对应的转换；命中则返回指向对应 PTE 的指针。
+ * 在 TLB 中查找虚拟地址 va 对应的转换。
+ * 累加 tlb_accesses；命中时返回指向 phys_mem 中对应字节的 host 指针，
+ * 缺失时累加 tlb_misses 并返回 NULL。
  */
 pte_t *checkTLB(void *va) {
-    (void)va;
+    if (!g_vm.initialized) return NULL;
+    unsigned long vaddr = (unsigned long)va;
+    unsigned long vpn = vaddr / PAGE_SIZE;
+    unsigned long off = vaddr % PAGE_SIZE;
+
+    pthread_mutex_lock(&g_vm.tlb_lock);
+    g_vm.tlb.tlb_accesses++;
+    for (int i = 0; i < TLB_SIZE; i++) {
+        if (g_vm.tlb.entry[i].valid && g_vm.tlb.entry[i].v_page == vpn) {
+            unsigned long ppn = g_vm.tlb.entry[i].p_page;
+            pthread_mutex_unlock(&g_vm.tlb_lock);
+            return (pte_t *)(g_vm.phys_mem + ppn * PAGE_SIZE + off);
+        }
+    }
+    g_vm.tlb.tlb_misses++;
+    pthread_mutex_unlock(&g_vm.tlb_lock);
     return NULL;
 }
 
 
 /*
- * 将一对 (虚拟地址, 物理地址) 加入 TLB。
+ * 将一对 (va, pa) 的虚拟页号到物理页号的映射写入 TLB。
+ * 若已存在相同 vpn 的项则更新，否则优先写入空闲项；
+ * 若 TLB 已满，按 FIFO 策略选择一个旧条目替换。
  */
 int addTLB(void *va, void *pa) {
-    (void)va;
-    (void)pa;
-    return -1;
+    if (!g_vm.initialized) return -1;
+    unsigned long vpn = (unsigned long)va / PAGE_SIZE;
+    unsigned long ppn = (unsigned long)pa / PAGE_SIZE;
+
+    /* FIFO 替换游标，使用静态变量在函数间保持状态。 */
+    static int fifo_cursor = 0;
+
+    pthread_mutex_lock(&g_vm.tlb_lock);
+    int free_slot = -1;
+    for (int i = 0; i < TLB_SIZE; i++) {
+        if (g_vm.tlb.entry[i].valid && g_vm.tlb.entry[i].v_page == vpn) {
+            g_vm.tlb.entry[i].p_page = ppn;
+            pthread_mutex_unlock(&g_vm.tlb_lock);
+            return 0;
+        }
+        if (!g_vm.tlb.entry[i].valid && free_slot < 0) free_slot = i;
+    }
+    int slot;
+    if (free_slot >= 0) {
+        slot = free_slot;
+    } else {
+        slot = fifo_cursor;
+        fifo_cursor = (fifo_cursor + 1) % TLB_SIZE;
+    }
+    g_vm.tlb.entry[slot].valid = true;
+    g_vm.tlb.entry[slot].v_page = vpn;
+    g_vm.tlb.entry[slot].p_page = ppn;
+    pthread_mutex_unlock(&g_vm.tlb_lock);
+    return 0;
 }
 
 
 /*
- * 输出 TLB 访问次数和缺失率。
+ * 输出 TLB 访问次数和缺失率（缺失率 = 缺失次数 / 访问次数 × 100%）。
  */
 void printTLBStats() {
     unsigned int acc, miss;
@@ -348,8 +406,8 @@ void printTLBStats() {
     miss = g_vm.tlb.tlb_misses;
     pthread_mutex_unlock(&g_vm.tlb_lock);
     double rate = (acc == 0) ? 0.0 : ((double)miss / (double)acc) * 100.0;
-    fprintf(stderr, "TLB Accesses: %u\n", acc);
-    fprintf(stderr, "TLB Misses : %u\n", miss);
+    fprintf(stderr, "TLB Accesses : %u\n", acc);
+    fprintf(stderr, "TLB Misses   : %u\n", miss);
     fprintf(stderr, "TLB Miss Rate: %.2f%%\n", rate);
 }
 

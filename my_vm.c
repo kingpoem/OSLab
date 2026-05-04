@@ -152,6 +152,23 @@ static unsigned long clear_pte_locked(pde_t *pgdir, unsigned long vaddr) {
 }
 
 /*
+ * 检查从 vaddr 起 size 字节区间内所有虚拟页是否均已分配。
+ * 全部已分配返回 1，否则返回 0。
+ * 调用方需自行持有 vm_lock。
+ */
+static int validate_range_locked(unsigned long vaddr, unsigned long size) {
+    if (size == 0) return 1;
+    unsigned long start_vpn = vaddr / PAGE_SIZE;
+    unsigned long end_vpn = (vaddr + size - 1) / PAGE_SIZE;
+    if (start_vpn == 0) return 0;  // 虚拟页 0 永远非法
+    if (end_vpn >= g_vm.num_v_pages) return 0;
+    for (unsigned long vpn = start_vpn; vpn <= end_vpn; vpn++) {
+        if (!get_bit(g_vm.virt_bitmap, vpn)) return 0;
+    }
+    return 1;
+}
+
+/*
  * 在 TLB 中查找并使包含 vpn 的条目失效。
  * 用于 myFree 等操作释放虚拟页时刷新 TLB。
  */
@@ -441,21 +458,83 @@ void myFree(void *va, int size) {
 
 /*
  * 将 val 指向的 size 字节数据写入由 va 起始的虚拟内存。
- * 若 size 跨越多页，循环按页拷贝。
+ * 若 va 起始 size 字节范围内任何虚拟页未分配，则输出错误并直接返回，不写入。
+ * 跨页访问时按页拷贝。
  */
 void myWrite(void *va, void *val, int size) {
-    (void)va;
-    (void)val;
-    (void)size;
+    if (size <= 0 || !val) return;
+    if (!g_vm.initialized) {
+        printf("ERROR: Writing to unallocated address\n");
+        return;
+    }
+
+    unsigned long vaddr = (unsigned long)va;
+    unsigned long remaining = (unsigned long)size;
+    const char *src = (const char *)val;
+
+    pthread_mutex_lock(&g_vm.vm_lock);
+    if (!validate_range_locked(vaddr, remaining)) {
+        pthread_mutex_unlock(&g_vm.vm_lock);
+        printf("ERROR: Writing to unallocated address\n");
+        return;
+    }
+
+    while (remaining > 0) {
+        pte_t *dst = translate(g_vm.page_dir, (void *)vaddr);
+        if (!dst) {
+            pthread_mutex_unlock(&g_vm.vm_lock);
+            printf("ERROR: Writing to unallocated address\n");
+            return;
+        }
+        unsigned long off = get_offset(vaddr);
+        unsigned long chunk = PAGE_SIZE - off;
+        if (chunk > remaining) chunk = remaining;
+        memcpy((void *)dst, src, chunk);
+        src += chunk;
+        vaddr += chunk;
+        remaining -= chunk;
+    }
+    pthread_mutex_unlock(&g_vm.vm_lock);
 }
 
 
 /*
  * 从虚拟地址 va 起读取 size 字节到 val 指向的缓冲区。
- * 写读流程必须先经过 TLB 查询并在缺失时回填。
+ * 若任何虚拟页未分配则输出错误并直接返回。
+ * （TLB 查询逻辑将在 step5 中接入到 translate 路径上）
  */
 void myRead(void *va, void *val, int size) {
-    (void)va;
-    (void)val;
-    (void)size;
+    if (size <= 0 || !val) return;
+    if (!g_vm.initialized) {
+        printf("ERROR: Reading from unallocated address\n");
+        return;
+    }
+
+    unsigned long vaddr = (unsigned long)va;
+    unsigned long remaining = (unsigned long)size;
+    char *dst = (char *)val;
+
+    pthread_mutex_lock(&g_vm.vm_lock);
+    if (!validate_range_locked(vaddr, remaining)) {
+        pthread_mutex_unlock(&g_vm.vm_lock);
+        printf("ERROR: Reading from unallocated address\n");
+        return;
+    }
+
+    while (remaining > 0) {
+        pte_t *src = translate(g_vm.page_dir, (void *)vaddr);
+        if (!src) {
+            pthread_mutex_unlock(&g_vm.vm_lock);
+            printf("ERROR: Reading from unallocated address\n");
+            return;
+        }
+        unsigned long off = get_offset(vaddr);
+        unsigned long chunk = PAGE_SIZE - off;
+        if (chunk > remaining) chunk = remaining;
+        memcpy(dst, (void *)src, chunk);
+        dst += chunk;
+        vaddr += chunk;
+        remaining -= chunk;
+    }
+    pthread_mutex_unlock(&g_vm.vm_lock);
 }

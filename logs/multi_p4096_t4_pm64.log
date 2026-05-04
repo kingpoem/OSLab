@@ -1,5 +1,5 @@
 Allocated Pointers: 
-8000 4000 24000 34000 28000 c000 10000 14000 18000 1c000 20000 2c000 30000 38000 3c000 
+1000 1d000 d000 f000 11000 13000 15000 17000 19000 1b000 3000 5000 7000 9000 b000 
 Initializing some of the memory by in multiple threads
 Randomly checking a thread allocation to see if everything worked correctly!
 1 1 1 1 1 1 1 1 1 1 

@@ -1,0 +1,6 @@
+TLB Accesses : 188540
+TLB Misses   : 55
+TLB Miss Rate: 0.03%
+[seq    ] total=65536 ints  sum=2147450880  time=5.96ms
+[stride ] stride=4096 steps=256(x3)  time=0.03ms
+[matmul ] size=30x30  time=1.37ms

@@ -1,7 +1,7 @@
-Allocating three arrays of 6000 bytes
-Addresses of the allocations: 5f08d1b0, 5f08e930, 5f0900b0
-Storing integers to generate a SIZExSIZE matrix
-Fetching matrix elements stored in the arrays
+Allocated Pointers: 
+4000 3c000 38000 8000 c000 10000 14000 18000 1c000 20000 24000 28000 2c000 30000 34000 
+Initializing some of the memory by in multiple threads
+Randomly checking a thread allocation to see if everything worked correctly!
 1 1 1 1 1 1 1 1 1 1 
 1 1 1 1 1 1 1 1 1 1 
 1 1 1 1 1 1 1 1 1 1 
@@ -12,7 +12,8 @@ Fetching matrix elements stored in the arrays
 1 1 1 1 1 1 1 1 1 1 
 1 1 1 1 1 1 1 1 1 1 
 1 1 1 1 1 1 1 1 1 1 
-Performing matrix multiplication with itself!
+Performing matrix multiplications in multiple threads threads!
+Randomly checking a thread allocation to see if everything worked correctly!
 10 10 10 10 10 10 10 10 10 10 
 10 10 10 10 10 10 10 10 10 10 
 10 10 10 10 10 10 10 10 10 10 
@@ -23,6 +24,5 @@ Performing matrix multiplication with itself!
 10 10 10 10 10 10 10 10 10 10 
 10 10 10 10 10 10 10 10 10 10 
 10 10 10 10 10 10 10 10 10 10 
-Freeing the allocations!
-Checking if allocations were freed!
-free function works
+Freeing everything in multiple threads!
+Free Worked!

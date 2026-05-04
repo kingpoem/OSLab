@@ -1,5 +1,5 @@
 Allocated Pointers: 
-efa00610 efc00610 efa019a0 efa02d30 efa040c0 efa05450 efa067e0 efa07b70 efa08f00 efa0a290 efa0b620 efa0c9b0 efa0dd40 efa0f0d0 efa10460 
+1000 1d000 3000 1b000 5000 7000 9000 b000 d000 f000 11000 13000 15000 17000 19000 
 Initializing some of the memory by in multiple threads
 Randomly checking a thread allocation to see if everything worked correctly!
 1 1 1 1 1 1 1 1 1 1 

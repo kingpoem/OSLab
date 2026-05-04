@@ -6,3 +6,6 @@ benchmark/externalCal
 benchmark/parallelCal
 benchmark/vectorMultiply
 benchmark/record/
+/tmp/_test_runner
+/tmp/_multi_runner
+/tmp/_tlb_runner

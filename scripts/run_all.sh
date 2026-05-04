@@ -2,17 +2,19 @@
 #
 # run_all.sh
 #
-# 一键运行多组配置 (PAGE_SIZE × TLB_SIZE × PM_SIZE) 下的：
-#   - 自定义实现 (libmy_vm.a)
-#   - 标准库基线实现 (libbaseline_vm.a)
-# 对官方 benchmark/test.c, benchmark/multi_test.c, tools/tlb_bench.c 三个程序
-# 分别执行，将 stdout+stderr 输出到 logs/{custom,baseline}_<bench>_<cfg>.log。
+# 一键运行多组配置 (PAGE_SIZE × TLB_SIZE × PM_SIZE) 下的基准测试。
+# 对每种配置执行：
+#   - benchmark/test.c       (官方单线程矩阵基准)
+#   - benchmark/multi_test.c (官方多线程基准)
+#   - tools/tlb_bench.c      (自定义 TLB 性能基准 + printTLBStats)
 #
-# 同时把所有自定义实现的 TLB 统计汇总到 logs/summary.csv。
+# 输出：
+#   - logs/<bench>_<cfg>.log         每次运行的 stdout+stderr
+#   - logs/summary.csv               TLB 统计汇总（仅 tlb_bench 行有数据）
 #
 # 用法：
-#   bash scripts/run_all.sh                # 运行内置默认配置矩阵
-#   PAGE=16384 TLB=8 PM=64 bash run_all.sh # 单一配置
+#   bash scripts/run_all.sh                 # 运行默认配置矩阵
+#   PAGE=16384 TLB=8 PM=64 bash run_all.sh  # 运行单一配置
 #
 
 set -u
@@ -23,14 +25,14 @@ DEF_BAK="$ROOT/defines.h.bak"
 
 mkdir -p "$LOG_DIR"
 SUMMARY="$LOG_DIR/summary.csv"
-echo "page_size,tlb_size,pm_size_mb,bench,impl,tlb_accesses,tlb_misses,tlb_miss_rate,exit" > "$SUMMARY"
+echo "page_size,tlb_size,pm_size_mb,bench,tlb_accesses,tlb_misses,tlb_miss_rate,exit" > "$SUMMARY"
 
 # --- 默认配置矩阵 ---------------------------------------------------------
 # 元组格式: PAGE_SIZE TLB_SIZE PM_MB
-# 说明：本实现按"一个二级页表 = 一个物理页"的约束设计，因此要求
+# 说明：本实现按"一个二级页表 = 一个物理页"的约束设计，要求
 #       num_pte_entries * sizeof(pte_t) <= PAGE_SIZE。
-#       在 32 位双级页表下，该约束等价于 PAGE_SIZE >= 4096。
-#       任务书提示评分仅测 log2(PAGE_SIZE) 为偶数的情况，下方仅列出受支持的合法配置。
+#       在 32 位双级页表下，等价于 PAGE_SIZE >= 4096。
+#       任务书提示助教仅测 log2(PAGE_SIZE) 为偶数，下方仅列合法配置。
 DEFAULT_CONFIGS=(
     "4096 32 64"
     "4096 16 64"
@@ -54,12 +56,7 @@ fi
 cp "$ROOT/defines.h" "$DEF_BAK"
 trap 'cp "$DEF_BAK" "$ROOT/defines.h"; rm -f "$DEF_BAK"; echo "[restored defines.h]"' EXIT
 
-# 预编译一份 baseline 库 (与配置无关)
-echo "[baseline] building libbaseline_vm.a"
-( cd "$ROOT/baseline" && gcc -g -c -m32 baseline_vm.c -o baseline_vm.o \
-  && ar -rc libbaseline_vm.a baseline_vm.o && ranlib libbaseline_vm.a ) >/dev/null
-
-# 解析 printTLBStats 的输出（stderr 与 stdout 合流时可能错位，改用宽松匹配）
+# 解析 printTLBStats 输出（stdout/stderr 合流可能错位，宽松匹配）
 parse_tlb() {
     local logfile="$1"
     local acc miss rate
@@ -73,7 +70,6 @@ run_one_config() {
     local PAGE_SIZE="$1"; local TLB_SIZE="$2"; local PM_MB="$3"
     local TAG="p${PAGE_SIZE}_t${TLB_SIZE}_pm${PM_MB}"
 
-    # 写入新的 defines.h
     cat > "$ROOT/defines.h" <<EOF
 #ifndef __DEFINES_H__
 #define __DEFINES_H__
@@ -91,49 +87,39 @@ EOF
     echo "Config: PAGE=${PAGE_SIZE}  TLB=${TLB_SIZE}  PM=${PM_MB}MB"
     echo "============================================================"
 
-    # ---- custom 实现 ------------------------------------------------
+    # 重新编译自定义实现
     ( cd "$ROOT" && make clean >/dev/null && make >/dev/null )
     if [[ ! -f "$ROOT/libmy_vm.a" ]]; then
-        echo "[FAIL] custom build failed"
+        echo "[FAIL] build failed"
         return
     fi
 
-    local CUSTOM_LIBS="-L${ROOT} -lmy_vm -m32 -lm"
-    local BASE_LIBS="-L${ROOT}/baseline -lbaseline_vm -m32 -lm"
+    local LIBS="-L${ROOT} -lmy_vm -m32 -lm"
 
     # benchmark/test.c
-    for IMPL in custom baseline; do
-        if [[ "$IMPL" == "custom" ]]; then LIBS="$CUSTOM_LIBS"; else LIBS="$BASE_LIBS"; fi
-        local LOG="$LOG_DIR/${IMPL}_test_${TAG}.log"
-        gcc -m32 "$ROOT/benchmark/test.c" $LIBS -o /tmp/_test_runner 2>>"$LOG"
-        /tmp/_test_runner > "$LOG" 2>&1
-        local rc=$?
-        echo "  test     [${IMPL}] -> $LOG (rc=$rc)"
-        echo "${PAGE_SIZE},${TLB_SIZE},${PM_MB},test,${IMPL},NA,NA,NA,$rc" >> "$SUMMARY"
-    done
+    local LOG="$LOG_DIR/test_${TAG}.log"
+    gcc -m32 "$ROOT/benchmark/test.c" $LIBS -o /tmp/_test_runner 2>>"$LOG"
+    /tmp/_test_runner > "$LOG" 2>&1
+    local rc=$?
+    echo "  test      -> $LOG (rc=$rc)"
+    echo "${PAGE_SIZE},${TLB_SIZE},${PM_MB},test,NA,NA,NA,$rc" >> "$SUMMARY"
 
     # benchmark/multi_test.c
-    for IMPL in custom baseline; do
-        if [[ "$IMPL" == "custom" ]]; then LIBS="$CUSTOM_LIBS"; else LIBS="$BASE_LIBS"; fi
-        local LOG="$LOG_DIR/${IMPL}_multi_${TAG}.log"
-        gcc -m32 "$ROOT/benchmark/multi_test.c" $LIBS -lpthread -o /tmp/_multi_runner 2>>"$LOG"
-        timeout 60 /tmp/_multi_runner > "$LOG" 2>&1
-        local rc=$?
-        echo "  multi    [${IMPL}] -> $LOG (rc=$rc)"
-        echo "${PAGE_SIZE},${TLB_SIZE},${PM_MB},multi,${IMPL},NA,NA,NA,$rc" >> "$SUMMARY"
-    done
+    LOG="$LOG_DIR/multi_${TAG}.log"
+    gcc -m32 "$ROOT/benchmark/multi_test.c" $LIBS -lpthread -o /tmp/_multi_runner 2>>"$LOG"
+    timeout 60 /tmp/_multi_runner > "$LOG" 2>&1
+    rc=$?
+    echo "  multi     -> $LOG (rc=$rc)"
+    echo "${PAGE_SIZE},${TLB_SIZE},${PM_MB},multi,NA,NA,NA,$rc" >> "$SUMMARY"
 
-    # tools/tlb_bench.c — 仅 custom 有意义，但 baseline 也跑用于性能对照
-    for IMPL in custom baseline; do
-        if [[ "$IMPL" == "custom" ]]; then LIBS="$CUSTOM_LIBS"; else LIBS="$BASE_LIBS"; fi
-        local LOG="$LOG_DIR/${IMPL}_tlb_${TAG}.log"
-        gcc -m32 "$ROOT/tools/tlb_bench.c" $LIBS -lpthread -o /tmp/_tlb_runner 2>>"$LOG"
-        timeout 60 /tmp/_tlb_runner > "$LOG" 2>&1
-        local rc=$?
-        local stats; stats="$(parse_tlb "$LOG")"
-        echo "  tlb_bench[${IMPL}] -> $LOG (rc=$rc, ${stats})"
-        echo "${PAGE_SIZE},${TLB_SIZE},${PM_MB},tlb_bench,${IMPL},${stats},$rc" >> "$SUMMARY"
-    done
+    # tools/tlb_bench.c
+    LOG="$LOG_DIR/tlb_${TAG}.log"
+    gcc -m32 "$ROOT/tools/tlb_bench.c" $LIBS -lpthread -o /tmp/_tlb_runner 2>>"$LOG"
+    timeout 60 /tmp/_tlb_runner > "$LOG" 2>&1
+    rc=$?
+    local stats; stats="$(parse_tlb "$LOG")"
+    echo "  tlb_bench -> $LOG (rc=$rc, ${stats})"
+    echo "${PAGE_SIZE},${TLB_SIZE},${PM_MB},tlb_bench,${stats},$rc" >> "$SUMMARY"
 }
 
 for cfg in "${CONFIGS[@]}"; do

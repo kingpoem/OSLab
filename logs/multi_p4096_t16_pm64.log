@@ -1,5 +1,5 @@
 Allocated Pointers: 
-f6400610 f6600610 f64019a0 f6402d30 f6405450 f64040c0 f64067e0 f6407b70 f6408f00 f640a290 f640b620 f640c9b0 f640dd40 f640f0d0 f66019a0 
+1000 3000 1b000 1d000 5000 15000 17000 7000 19000 9000 b000 d000 f000 11000 13000 
 Initializing some of the memory by in multiple threads
 Randomly checking a thread allocation to see if everything worked correctly!
 1 1 1 1 1 1 1 1 1 1 
@@ -25,4 +25,4 @@ Randomly checking a thread allocation to see if everything worked correctly!
 10 10 10 10 10 10 10 10 10 10 
 10 10 10 10 10 10 10 10 10 10 
 Freeing everything in multiple threads!
-Some Problem with free!
+Free Worked!

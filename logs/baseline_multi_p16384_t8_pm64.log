@@ -1,0 +1,28 @@
+Allocated Pointers: 
+f1900610 f1b00610 f190c9b0 f19019a0 f1902d30 f19040c0 f1905450 f19067e0 f1907b70 f1908f00 f190a290 f190b620 f190dd40 f190f0d0 f1910460 
+Initializing some of the memory by in multiple threads
+Randomly checking a thread allocation to see if everything worked correctly!
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+Performing matrix multiplications in multiple threads threads!
+Randomly checking a thread allocation to see if everything worked correctly!
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+Freeing everything in multiple threads!
+Free Worked!

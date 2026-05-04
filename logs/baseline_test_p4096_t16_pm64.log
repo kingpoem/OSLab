@@ -1,0 +1,28 @@
+Allocating three arrays of 6000 bytes
+Addresses of the allocations: 5d50a1b0, 5d50b930, 5d50d0b0
+Storing integers to generate a SIZExSIZE matrix
+Fetching matrix elements stored in the arrays
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+Performing matrix multiplication with itself!
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+Freeing the allocations!
+Checking if allocations were freed!
+free function works

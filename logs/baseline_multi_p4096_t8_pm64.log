@@ -1,0 +1,28 @@
+Allocated Pointers: 
+ee600610 ee6040c0 ee605450 ee6067e0 ee6019a0 ee602d30 ee60dd40 ee610460 ee6117f0 ee608f00 ee607b70 ee60a290 ee60c9b0 ee60b620 ee60f0d0 
+Initializing some of the memory by in multiple threads
+Randomly checking a thread allocation to see if everything worked correctly!
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+1 1 1 1 1 1 1 1 1 1 
+Performing matrix multiplications in multiple threads threads!
+Randomly checking a thread allocation to see if everything worked correctly!
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+10 10 10 10 10 10 10 10 10 10 
+Freeing everything in multiple threads!
+Free Worked!

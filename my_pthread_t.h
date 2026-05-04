@@ -8,7 +8,7 @@
 #define _GNU_SOURCE
 
 /* To use real pthread Library in Benchmark, you have to comment the USE_MY_PTHREAD macro */
-// #define USE_MY_PTHREAD 1
+#define USE_MY_PTHREAD 1
 
 /* include lib header files that you need here: */
 #include <unistd.h>
@@ -16,56 +16,65 @@
 #include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <ucontext.h>
 #include <signal.h>
 #include <semaphore.h>
+#include <sys/time.h>
 
 /* defile necessary MACRO here, for example, thread upper bound,
    stack size, priority queue levels, time quantum, etc. */
+#define STACK_SIZE       (64 * 1024)   // 每个线程栈大小：64KB
+#define MAX_THREADS      256           // 系统最多可创建的线程数（含主线程）
+#define TIME_QUANTUM_MS  10            // 时间片长度（毫秒）
+#define MLFQ_LEVELS      4             // MLFQ 优先级队列级数
 
+typedef unsigned int my_pthread_t;
 
-typedef uint my_pthread_t;
-
-typedef struct threadControlBlock {
-	/* add important states in a thread control block */
-	// thread Id
-	// thread status
-	// thread context
-	// thread stack
-	// thread priority
-	// And more ...
-
-	// YOUR CODE HERE
-} tcb; 
-
-/* mutex struct definition */
-typedef struct my_pthread_mutex_t {
-	/* add something here */
-
-	// YOUR CODE HERE
-} my_pthread_mutex_t;
-
-/* define your data structures here: */
-// Feel free to add your own auxiliary data structures (linked list or queue etc...)
-
-// Below are some examples, feel free to modify and define your own structures:
 // Thread Status
 typedef enum threadStatus {
-	NOT_STARTED = 0,
-	RUNNING,
-	SUSPENDED,
-	TERMINATED,
-	FINISHED,
+	NOT_STARTED = 0,  // 未启动
+	RUNNING,          // 正在运行
+	READY,            // 就绪（在 ready 队列）
+	BLOCKED,          // 阻塞（等待 mutex 或 join）
+	FINISHED,         // 已终止
 } threadStatus;
 
 // Schedule Policy
 typedef enum schedPolicy {
-	POLICY_RR = 0,
-	POLICY_MLFQ,
-	POLICY_PSJF
+	POLICY_RR = 0,    // 轮转（最简单的 FCFS / RR）
+	POLICY_MLFQ,      // 多级反馈队列
+	POLICY_PSJF       // 抢占式最短作业优先
 } schedPolicy;
 
-// YOUR CODE HERE
+typedef struct threadControlBlock {
+	my_pthread_t tid;                       // 线程ID
+	threadStatus status;                    // 线程状态
+	ucontext_t   ctx;                       // 线程上下文
+	void        *stack;                     // 线程栈起始地址
+	void        *retval;                    // 线程返回值
+	struct threadControlBlock *joiner;      // 等待该线程结束的线程（最多一个）
+	int          time_slices;               // 已运行时间片计数（用于 PSJF）
+	int          priority;                  // 当前优先级（MLFQ 用，0 最高）
+	void *(*function)(void *);              // 入口函数
+	void        *arg;                       // 入口函数参数
+	struct threadControlBlock *next;        // 队列中下一节点指针
+} tcb;
+
+/* mutex struct definition */
+typedef struct my_pthread_mutex_t {
+	int          locked;       // 锁状态：0 空闲，1 已占用
+	int          initialized;  // 是否已初始化
+	tcb         *owner;        // 当前持有者
+	tcb         *wait_head;    // 等待队列头
+	tcb         *wait_tail;    // 等待队列尾
+} my_pthread_mutex_t;
+
+/* simple thread queue (singly-linked list, head/tail) */
+typedef struct threadQueue {
+	tcb *head;  // 队列头
+	tcb *tail;  // 队列尾
+} threadQueue;
 
 
 /* Function Declarations: */

@@ -1,2 +1,12 @@
 warmup.dSYM/
 warmup
+*.o
+*.a
+test_step1
+test_step2
+test_step3
+test_step4
+Benchmark/parallelCal
+Benchmark/vectorMultiply
+Benchmark/externalCal
+Benchmark/record/

@@ -1,0 +1,200 @@
+======================================================================
+STANDARD PTHREAD BENCHMARK SUITE
+host:    Linux poem-VMware-Virtual-Platform 6.17.0-20-generic #20~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Thu Mar 19 01:28:37 UTC 2 x86_64 x86_64 x86_64 GNU/Linux
+started: 2026-05-06 21:52:05
+======================================================================
+== building (libmy_pthread.a is linked but unused) ==
+======================================================================
+[2026-05-06 21:52:05] STANDARD PTHREAD
+threads=1 2 4 8  runs=3  timeout=180s
+======================================================================
+
+>>> parallelCal  threads=1  run #1
+running time: 28219 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> parallelCal  threads=1  run #2
+running time: 30679 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> parallelCal  threads=1  run #3
+running time: 32078 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> vectorMultiply  threads=1  run #1
+running time: 42 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> vectorMultiply  threads=1  run #2
+running time: 138 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> vectorMultiply  threads=1  run #3
+running time: 53 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> externalCal  threads=1  run #1
+running time: 472 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+>>> externalCal  threads=1  run #2
+running time: 483 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+>>> externalCal  threads=1  run #3
+running time: 462 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+----------------------------------------------------------------------
+
+>>> parallelCal  threads=2  run #1
+running time: 20572 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> parallelCal  threads=2  run #2
+running time: 24434 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> parallelCal  threads=2  run #3
+running time: 28564 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> vectorMultiply  threads=2  run #1
+running time: 128 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> vectorMultiply  threads=2  run #2
+running time: 143 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> vectorMultiply  threads=2  run #3
+running time: 73 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> externalCal  threads=2  run #1
+running time: 995 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+>>> externalCal  threads=2  run #2
+running time: 1539 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+>>> externalCal  threads=2  run #3
+running time: 1016 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+----------------------------------------------------------------------
+
+>>> parallelCal  threads=4  run #1
+running time: 23136 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> parallelCal  threads=4  run #2
+running time: 21365 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> parallelCal  threads=4  run #3
+running time: 21174 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> vectorMultiply  threads=4  run #1
+running time: 132 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> vectorMultiply  threads=4  run #2
+running time: 115 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> vectorMultiply  threads=4  run #3
+running time: 112 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> externalCal  threads=4  run #1
+running time: 976 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+>>> externalCal  threads=4  run #2
+running time: 1032 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+>>> externalCal  threads=4  run #3
+running time: 977 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+----------------------------------------------------------------------
+
+>>> parallelCal  threads=8  run #1
+running time: 18599 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> parallelCal  threads=8  run #2
+running time: 19221 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> parallelCal  threads=8  run #3
+running time: 23494 micro-seconds
+sum is: 83842816
+verified sum is: 83842816
+
+>>> vectorMultiply  threads=8  run #1
+running time: 123 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> vectorMultiply  threads=8  run #2
+running time: 103 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> vectorMultiply  threads=8  run #3
+running time: 88 micro-seconds
+res is: 631560480
+verified res is: 631560480
+
+>>> externalCal  threads=8  run #1
+running time: 1032 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+>>> externalCal  threads=8  run #2
+running time: 1234 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+>>> externalCal  threads=8  run #3
+running time: 1068 micro-seconds
+sum is: -1914330860
+verified sum is: -1914330860
+
+----------------------------------------------------------------------
+
+[2026-05-06 22:07:19] STD_PTHREAD suite finished

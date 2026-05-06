@@ -10,6 +10,4 @@ Benchmark/parallelCal
 Benchmark/vectorMultiply
 Benchmark/externalCal
 Benchmark/record/
-log_my_pthread.log
-log_std_pthread.log
 my_pthread_t.h.bak

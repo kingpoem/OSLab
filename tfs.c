@@ -472,33 +472,75 @@ static void tfs_destroy(void *userdata) {
 	dev_close();
 }
 
+/* Fill POSIX attributes for a path resolved by TFS. */
 static int tfs_getattr(const char *path, struct stat *stbuf) {
+	struct inode inode;
+	int result;
 
-	// Step 1: call get_node_by_path() to get inode from path
-
-	// Step 2: fill attribute of file into stbuf from inode
-
-		stbuf->st_mode   = S_IFDIR | 0755;
-		stbuf->st_nlink  = 2;
-		time(&stbuf->st_mtime);
-
+	if (stbuf == NULL)
+		return -EINVAL;
+	result = get_node_by_path(path, 0, &inode);
+	if (result < 0)
+		return result;
+	memset(stbuf, 0, sizeof(*stbuf));
+	*stbuf = inode.vstat;
+	stbuf->st_ino = inode.ino;
+	stbuf->st_size = inode.size;
+	stbuf->st_nlink = inode.link;
 	return 0;
 }
 
+/* Verify that a path exists and refers to a directory. */
 static int tfs_opendir(const char *path, struct fuse_file_info *fi) {
+	struct inode inode;
+	int result;
 
-	// Step 1: Call get_node_by_path() to get inode from path
-
-	// Step 2: If not find, return -1
-
-    return 0;
+	(void)fi;
+	result = get_node_by_path(path, 0, &inode);
+	if (result < 0)
+		return result;
+	if (!S_ISDIR(inode.vstat.st_mode))
+		return -ENOTDIR;
+	return 0;
 }
 
+/* Enumerate valid entries from every direct block of a directory. */
 static int tfs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
+	struct inode inode;
+	struct dirent entries[BLOCK_SIZE / sizeof(struct dirent)];
+	int block_index;
+	size_t entry_index;
+	int result;
 
-	// Step 1: Call get_node_by_path() to get inode from path
+	(void)offset;
+	(void)fi;
+	if (buffer == NULL || filler == NULL)
+		return -EINVAL;
+	result = get_node_by_path(path, 0, &inode);
+	if (result < 0)
+		return result;
+	if (!S_ISDIR(inode.vstat.st_mode))
+		return -ENOTDIR;
 
-	// Step 2: Read directory entries from its data blocks, and copy them to filler
+	if (filler(buffer, ".", NULL, 0) != 0)
+		return 0;
+	if (filler(buffer, "..", NULL, 0) != 0)
+		return 0;
+
+	for (block_index = 0; block_index < 16; block_index++) {
+		if (inode.direct_ptr[block_index] < 0)
+			continue;
+		if (bio_read(inode.direct_ptr[block_index], entries) != BLOCK_SIZE)
+			return -EIO;
+		for (entry_index = 0;
+		     entry_index < BLOCK_SIZE / sizeof(struct dirent);
+		     entry_index++) {
+			if (!entries[entry_index].valid)
+				continue;
+			if (filler(buffer, entries[entry_index].name, NULL, 0) != 0)
+				return 0;
+		}
+	}
 
 	return 0;
 }
@@ -562,12 +604,17 @@ static int tfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
 	return 0;
 }
 
+/* Verify that a path exists and refers to a regular file. */
 static int tfs_open(const char *path, struct fuse_file_info *fi) {
+	struct inode inode;
+	int result;
 
-	// Step 1: Call get_node_by_path() to get inode from path
-
-	// Step 2: If not find, return -1
-
+	(void)fi;
+	result = get_node_by_path(path, 0, &inode);
+	if (result < 0)
+		return result;
+	if (S_ISDIR(inode.vstat.st_mode))
+		return -EISDIR;
 	return 0;
 }
 

@@ -269,14 +269,11 @@ static int get_file_block(struct inode *inode, uint32_t logical_block,
 	return block_no;
 }
 
-/* 
- * Get available inode number from bitmap
- */
+/* Allocate and persist the first free inode number. */
 int get_avail_ino() {
 	unsigned char bitmap[BLOCK_SIZE];
 	int ino;
 
-	/* Allocate the first free inode recorded in the inode bitmap. */
 	if (bio_read(superblock.i_bitmap_blk, bitmap) != BLOCK_SIZE)
 		return -EIO;
 
@@ -292,14 +289,11 @@ int get_avail_ino() {
 	return -ENOSPC;
 }
 
-/* 
- * Get available data block number from bitmap
- */
+/* Allocate and persist the first free data block number. */
 int get_avail_blkno() {
 	unsigned char bitmap[BLOCK_SIZE];
 	int index;
 
-	/* Allocate the first free block recorded in the data bitmap. */
 	if (bio_read(superblock.d_bitmap_blk, bitmap) != BLOCK_SIZE)
 		return -EIO;
 
@@ -315,16 +309,13 @@ int get_avail_blkno() {
 	return -ENOSPC;
 }
 
-/* 
- * inode operations
- */
+/* Read one inode from its fixed slot in the inode table. */
 int readi(uint16_t ino, struct inode *inode) {
 	char block[BLOCK_SIZE];
 	uint32_t per_block = inodes_per_block();
 	uint32_t block_no;
 	uint32_t offset;
 
-	/* Read one inode from its fixed slot in the inode table. */
 	if (inode == NULL || ino >= superblock.max_inum || per_block == 0)
 		return -EINVAL;
 	block_no = superblock.i_start_blk + ino / per_block;
@@ -335,13 +326,13 @@ int readi(uint16_t ino, struct inode *inode) {
 	return 0;
 }
 
+/* Update one inode without changing nearby inode table entries. */
 int writei(uint16_t ino, struct inode *inode) {
 	char block[BLOCK_SIZE];
 	uint32_t per_block = inodes_per_block();
 	uint32_t block_no;
 	uint32_t offset;
 
-	/* Update one inode in its fixed slot without changing nearby inodes. */
 	if (inode == NULL || ino >= superblock.max_inum || per_block == 0)
 		return -EINVAL;
 	block_no = superblock.i_start_blk + ino / per_block;
@@ -355,16 +346,13 @@ int writei(uint16_t ino, struct inode *inode) {
 }
 
 
-/* 
- * directory operations
- */
+/* Find one named entry in the direct blocks of a directory. */
 int dir_find(uint16_t ino, const char *fname, size_t name_len, struct dirent *dirent) {
 	struct inode dir_inode;
 	struct dirent entries[BLOCK_SIZE / sizeof(struct dirent)];
 	int block_index;
 	size_t entry_index;
 
-	/* Find a named entry in the direct blocks of one directory. */
 	if (fname == NULL || dirent == NULL || name_len == 0 ||
 	    name_len >= sizeof(entries[0].name))
 		return -EINVAL;
@@ -396,6 +384,7 @@ int dir_find(uint16_t ino, const char *fname, size_t name_len, struct dirent *di
 	return -ENOENT;
 }
 
+/* Add one unique name to a directory and allocate space if needed. */
 int dir_add(struct inode dir_inode, uint16_t f_ino, const char *fname, size_t name_len) {
 	struct dirent entries[BLOCK_SIZE / sizeof(struct dirent)];
 	struct dirent existing;
@@ -406,7 +395,6 @@ int dir_add(struct inode dir_inode, uint16_t f_ino, const char *fname, size_t na
 	size_t entry_index;
 	time_t now;
 
-	/* Add one unique name to a directory, allocating a block if needed. */
 	if (!dir_inode.valid || !S_ISDIR(dir_inode.vstat.st_mode))
 		return -ENOTDIR;
 	if (fname == NULL || name_len == 0 ||
@@ -474,13 +462,13 @@ update_inode:
 	return 0;
 }
 
+/* Remove one named directory entry and reclaim an empty entry block. */
 int dir_remove(struct inode dir_inode, const char *fname, size_t name_len) {
 	struct dirent entries[BLOCK_SIZE / sizeof(struct dirent)];
 	int block_index;
 	size_t entry_index;
 	time_t now;
 
-	/* Remove one named entry and release its directory block if empty. */
 	if (!dir_inode.valid || !S_ISDIR(dir_inode.vstat.st_mode))
 		return -ENOTDIR;
 	if (fname == NULL || name_len == 0 ||
@@ -542,16 +530,13 @@ int dir_remove(struct inode dir_inode, const char *fname, size_t name_len) {
 	return -ENOENT;
 }
 
-/* 
- * namei operation
- */
+/* Resolve an absolute path one directory component at a time. */
 int get_node_by_path(const char *path, uint16_t ino, struct inode *inode) {
 	char path_copy[PATH_MAX];
 	char *component;
 	char *saveptr = NULL;
 	struct inode current;
 
-	/* Resolve an absolute path one directory component at a time. */
 	if (path == NULL || inode == NULL || path[0] != '/')
 		return -EINVAL;
 	if (strnlen(path, sizeof(path_copy)) >= sizeof(path_copy))
@@ -584,16 +569,13 @@ int get_node_by_path(const char *path, uint16_t ino, struct inode *inode) {
 	return 0;
 }
 
-/* 
- * Make file system
- */
+/* Create a clean disk image with a root directory inode. */
 int tfs_mkfs() {
 	char block[BLOCK_SIZE];
 	struct inode root_inode;
 	int root_ino;
 	int i;
 
-	/* Create a clean disk and write the fixed on-disk layout. */
 	dev_init(diskfile_path);
 	memset(&superblock, 0, sizeof(superblock));
 	superblock.magic_num = MAGIC_NUM;
@@ -646,13 +628,10 @@ int tfs_mkfs() {
 }
 
 
-/* 
- * FUSE file operations
- */
+/* Open an existing file system or create a new formatted disk. */
 static void *tfs_init(struct fuse_conn_info *conn) {
 	char block[BLOCK_SIZE];
 
-	/* Open an existing file system or create a new formatted disk. */
 	(void)conn;
 	if (access(diskfile_path, F_OK) != 0) {
 		if (tfs_mkfs() < 0)
@@ -661,8 +640,10 @@ static void *tfs_init(struct fuse_conn_info *conn) {
 		return NULL;
 	}
 
-	if (bio_read(0, block) != BLOCK_SIZE)
+	if (bio_read(0, block) != BLOCK_SIZE) {
+		dev_close();
 		return NULL;
+	}
 	memcpy(&superblock, block, sizeof(superblock));
 	if (superblock.magic_num != MAGIC_NUM) {
 		fprintf(stderr, "Invalid TFS disk image\n");
@@ -673,8 +654,8 @@ static void *tfs_init(struct fuse_conn_info *conn) {
 	return NULL;
 }
 
+/* Close the disk when FUSE unmounts the file system. */
 static void tfs_destroy(void *userdata) {
-	/* Close the disk when FUSE unmounts the file system. */
 	(void)userdata;
 	dev_close();
 }
@@ -771,8 +752,11 @@ static int tfs_mkdir(const char *path, mode_t mode) {
 		return result;
 	if (!S_ISDIR(parent_inode.vstat.st_mode))
 		return -ENOTDIR;
-	if (dir_find(parent_inode.ino, name, strlen(name), &existing) == 0)
+	result = dir_find(parent_inode.ino, name, strlen(name), &existing);
+	if (result == 0)
 		return -EEXIST;
+	if (result != -ENOENT)
+		return result;
 
 	new_ino = get_avail_ino();
 	if (new_ino < 0)
@@ -838,10 +822,11 @@ static int tfs_rmdir(const char *path) {
 	return 0;
 }
 
+/* Keep the releasedir callback as a no-op for this file system. */
 static int tfs_releasedir(const char *path, struct fuse_file_info *fi) {
-	// For this project, you don't need to fill this function
-	// But DO NOT DELETE IT!
-    return 0;
+	(void)path;
+	(void)fi;
+	return 0;
 }
 
 /* Create one empty regular file and link it into its parent. */
@@ -863,8 +848,11 @@ static int tfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
 		return result;
 	if (!S_ISDIR(parent_inode.vstat.st_mode))
 		return -ENOTDIR;
-	if (dir_find(parent_inode.ino, name, strlen(name), &existing) == 0)
+	result = dir_find(parent_inode.ino, name, strlen(name), &existing);
+	if (result == 0)
 		return -EEXIST;
+	if (result != -ENOENT)
+		return result;
 
 	new_ino = get_avail_ino();
 	if (new_ino < 0)
@@ -896,7 +884,7 @@ static int tfs_open(const char *path, struct fuse_file_info *fi) {
 	return 0;
 }
 
-/* Read regular-file data across direct blocks with offset support. */
+/* Read regular-file data across direct and indirect blocks. */
 static int tfs_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fi) {
 	struct inode inode;
 	char block[BLOCK_SIZE];
@@ -945,12 +933,13 @@ static int tfs_read(const char *path, char *buffer, size_t size, off_t offset, s
 	return (int)completed;
 }
 
-/* Write regular-file data across direct blocks with offset support. */
+/* Write regular-file data across direct and indirect blocks. */
 static int tfs_write(const char *path, const char *buffer, size_t size, off_t offset, struct fuse_file_info *fi) {
 	struct inode inode;
 	char block[BLOCK_SIZE];
 	size_t completed = 0;
 	uint64_t end_position;
+	int failure = -EIO;
 	int result;
 
 	(void)fi;
@@ -981,18 +970,24 @@ static int tfs_write(const char *path, const char *buffer, size_t size, off_t of
 		if (chunk > size - completed)
 			chunk = size - completed;
 		block_no = get_file_block(&inode, logical_block, true);
-		if (block_no < 0)
+		if (block_no < 0) {
+			failure = block_no;
 			break;
-		if (bio_read(block_no, block) != BLOCK_SIZE)
+		}
+		if (bio_read(block_no, block) != BLOCK_SIZE) {
+			failure = -EIO;
 			break;
+		}
 		memcpy(block + block_offset, buffer + completed, chunk);
-		if (bio_write(block_no, block) != BLOCK_SIZE)
+		if (bio_write(block_no, block) != BLOCK_SIZE) {
+			failure = -EIO;
 			break;
+		}
 		completed += chunk;
 	}
 
 	if (completed == 0)
-		return -EIO;
+		return failure;
 	if ((uint64_t)offset + completed > inode.size)
 		inode.size = offset + completed;
 	inode.vstat.st_size = inode.size;
@@ -1003,7 +998,7 @@ static int tfs_write(const char *path, const char *buffer, size_t size, off_t of
 	return (int)completed;
 }
 
-/* Remove one regular file and reclaim its inode and direct blocks. */
+/* Remove one regular file and reclaim all of its allocated blocks. */
 static int tfs_unlink(const char *path) {
 	char parent_path[PATH_MAX];
 	char name[sizeof(((struct dirent *)0)->name)];
@@ -1028,28 +1023,32 @@ static int tfs_unlink(const char *path) {
 	return delete_inode(&target_inode);
 }
 
+/* Keep the truncate callback as a no-op required by the framework. */
 static int tfs_truncate(const char *path, off_t size) {
-	// For this project, you don't need to fill this function
-	// But DO NOT DELETE IT!
-    return 0;
-}
-
-static int tfs_release(const char *path, struct fuse_file_info *fi) {
-	// For this project, you don't need to fill this function
-	// But DO NOT DELETE IT!
+	(void)path;
+	(void)size;
 	return 0;
 }
 
-static int tfs_flush(const char * path, struct fuse_file_info * fi) {
-	// For this project, you don't need to fill this function
-	// But DO NOT DELETE IT!
-    return 0;
+/* Keep the release callback as a no-op required by the framework. */
+static int tfs_release(const char *path, struct fuse_file_info *fi) {
+	(void)path;
+	(void)fi;
+	return 0;
 }
 
+/* Keep the flush callback as a no-op required by the framework. */
+static int tfs_flush(const char * path, struct fuse_file_info * fi) {
+	(void)path;
+	(void)fi;
+	return 0;
+}
+
+/* Keep the timestamp callback as a no-op required by the framework. */
 static int tfs_utimens(const char *path, const struct timespec tv[2]) {
-	// For this project, you don't need to fill this function
-	// But DO NOT DELETE IT!
-    return 0;
+	(void)path;
+	(void)tv;
+	return 0;
 }
 
 
@@ -1077,10 +1076,20 @@ static struct fuse_operations tfs_ope = {
 };
 
 
+/* Build the disk path and start the FUSE event loop. */
 int main(int argc, char *argv[]) {
 	int fuse_stat;
+	size_t cwd_length;
 
-	getcwd(diskfile_path, PATH_MAX);
+	if (getcwd(diskfile_path, sizeof(diskfile_path)) == NULL) {
+		perror("getcwd failed");
+		return EXIT_FAILURE;
+	}
+	cwd_length = strlen(diskfile_path);
+	if (cwd_length + strlen("/DISKFILE") >= sizeof(diskfile_path)) {
+		fprintf(stderr, "TFS disk path is too long\n");
+		return EXIT_FAILURE;
+	}
 	strcat(diskfile_path, "/DISKFILE");
 
 	fuse_stat = fuse_main(argc, argv, &tfs_ope, NULL);

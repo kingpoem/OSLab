@@ -21,6 +21,9 @@ char diskfile_path[PATH_MAX];
 
 static struct superblock superblock;
 
+int readi(uint16_t ino, struct inode *inode);
+int writei(uint16_t ino, struct inode *inode);
+
 /* Return the number of inodes stored in one inode table block. */
 static uint32_t inodes_per_block(void) {
 	return BLOCK_SIZE / sizeof(struct inode);
@@ -60,6 +63,105 @@ static int release_blkno(int block_no) {
 	if (bio_write(superblock.d_bitmap_blk, bitmap) != BLOCK_SIZE)
 		return -EIO;
 	return 0;
+}
+
+/* Split an absolute path into a parent path and one final name. */
+static int split_parent_path(const char *path, char *parent, char *name) {
+	char copy[PATH_MAX];
+	char *last_slash;
+	size_t length;
+
+	if (path == NULL || parent == NULL || name == NULL || path[0] != '/')
+		return -EINVAL;
+	length = strnlen(path, sizeof(copy));
+	if (length == 0 || length >= sizeof(copy))
+		return -ENAMETOOLONG;
+	strcpy(copy, path);
+	while (length > 1 && copy[length - 1] == '/')
+		copy[--length] = '\0';
+	if (strcmp(copy, "/") == 0)
+		return -EINVAL;
+
+	last_slash = strrchr(copy, '/');
+	if (last_slash == NULL || last_slash[1] == '\0')
+		return -EINVAL;
+	if (strlen(last_slash + 1) >= sizeof(((struct dirent *)0)->name))
+		return -ENAMETOOLONG;
+	strcpy(name, last_slash + 1);
+	if (last_slash == copy) {
+		strcpy(parent, "/");
+	} else {
+		*last_slash = '\0';
+		strcpy(parent, copy);
+	}
+	return 0;
+}
+
+/* Initialize a new in-memory inode with no allocated blocks. */
+static void initialize_inode(struct inode *inode, uint16_t ino, mode_t mode) {
+	int i;
+	time_t now = time(NULL);
+
+	memset(inode, 0, sizeof(*inode));
+	inode->ino = ino;
+	inode->valid = 1;
+	inode->type = mode & S_IFMT;
+	inode->link = S_ISDIR(mode) ? 2 : 1;
+	for (i = 0; i < 16; i++)
+		inode->direct_ptr[i] = -1;
+	for (i = 0; i < 8; i++)
+		inode->indirect_ptr[i] = -1;
+	inode->vstat.st_ino = ino;
+	inode->vstat.st_mode = mode;
+	inode->vstat.st_nlink = inode->link;
+	inode->vstat.st_uid = getuid();
+	inode->vstat.st_gid = getgid();
+	inode->vstat.st_blksize = BLOCK_SIZE;
+	inode->vstat.st_atime = now;
+	inode->vstat.st_mtime = now;
+	inode->vstat.st_ctime = now;
+}
+
+/* Return whether a directory has no valid child entries. */
+static int directory_is_empty(const struct inode *inode) {
+	struct dirent entries[BLOCK_SIZE / sizeof(struct dirent)];
+	int block_index;
+	size_t entry_index;
+
+	if (inode == NULL || !S_ISDIR(inode->vstat.st_mode))
+		return -ENOTDIR;
+	for (block_index = 0; block_index < 16; block_index++) {
+		if (inode->direct_ptr[block_index] < 0)
+			continue;
+		if (bio_read(inode->direct_ptr[block_index], entries) != BLOCK_SIZE)
+			return -EIO;
+		for (entry_index = 0;
+		     entry_index < BLOCK_SIZE / sizeof(struct dirent);
+		     entry_index++) {
+			if (entries[entry_index].valid)
+				return 0;
+		}
+	}
+	return 1;
+}
+
+/* Release direct blocks and clear an inode from disk and bitmap. */
+static int delete_inode(struct inode *inode) {
+	struct inode cleared;
+	int block_index;
+
+	if (inode == NULL || inode->ino == 0)
+		return -EINVAL;
+	for (block_index = 0; block_index < 16; block_index++) {
+		if (inode->direct_ptr[block_index] < 0)
+			continue;
+		if (release_blkno(inode->direct_ptr[block_index]) < 0)
+			return -EIO;
+	}
+	memset(&cleared, 0, sizeof(cleared));
+	if (writei(inode->ino, &cleared) < 0)
+		return -EIO;
+	return release_ino(inode->ino);
 }
 
 /* 
@@ -546,38 +648,88 @@ static int tfs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, o
 }
 
 
+/* Create one empty directory and link it into its parent. */
 static int tfs_mkdir(const char *path, mode_t mode) {
+	char parent_path[PATH_MAX];
+	char name[sizeof(((struct dirent *)0)->name)];
+	struct inode parent_inode;
+	struct inode new_inode;
+	struct dirent existing;
+	int new_ino;
+	int result;
 
-	// Step 1: Use dirname() and basename() to separate parent directory path and target directory name
+	result = split_parent_path(path, parent_path, name);
+	if (result < 0)
+		return result;
+	result = get_node_by_path(parent_path, 0, &parent_inode);
+	if (result < 0)
+		return result;
+	if (!S_ISDIR(parent_inode.vstat.st_mode))
+		return -ENOTDIR;
+	if (dir_find(parent_inode.ino, name, strlen(name), &existing) == 0)
+		return -EEXIST;
 
-	// Step 2: Call get_node_by_path() to get inode of parent directory
+	new_ino = get_avail_ino();
+	if (new_ino < 0)
+		return new_ino;
+	initialize_inode(&new_inode, new_ino, S_IFDIR | (mode & 07777));
+	if (writei(new_ino, &new_inode) < 0) {
+		release_ino(new_ino);
+		return -EIO;
+	}
+	result = dir_add(parent_inode, new_ino, name, strlen(name));
+	if (result < 0) {
+		delete_inode(&new_inode);
+		return result;
+	}
 
-	// Step 3: Call get_avail_ino() to get an available inode number
-
-	// Step 4: Call dir_add() to add directory entry of target directory to parent directory
-
-	// Step 5: Update inode for target directory
-
-	// Step 6: Call writei() to write inode to disk
-	
-
+	if (readi(parent_inode.ino, &parent_inode) == 0) {
+		parent_inode.link++;
+		parent_inode.vstat.st_nlink = parent_inode.link;
+		parent_inode.vstat.st_ctime = time(NULL);
+		writei(parent_inode.ino, &parent_inode);
+	}
 	return 0;
 }
 
+/* Remove one empty directory and reclaim its inode. */
 static int tfs_rmdir(const char *path) {
+	char parent_path[PATH_MAX];
+	char name[sizeof(((struct dirent *)0)->name)];
+	struct inode parent_inode;
+	struct inode target_inode;
+	int result;
 
-	// Step 1: Use dirname() and basename() to separate parent directory path and target directory name
+	result = split_parent_path(path, parent_path, name);
+	if (result < 0)
+		return result;
+	result = get_node_by_path(path, 0, &target_inode);
+	if (result < 0)
+		return result;
+	if (!S_ISDIR(target_inode.vstat.st_mode))
+		return -ENOTDIR;
+	result = directory_is_empty(&target_inode);
+	if (result < 0)
+		return result;
+	if (result == 0)
+		return -ENOTEMPTY;
+	result = get_node_by_path(parent_path, 0, &parent_inode);
+	if (result < 0)
+		return result;
+	result = dir_remove(parent_inode, name, strlen(name));
+	if (result < 0)
+		return result;
+	result = delete_inode(&target_inode);
+	if (result < 0)
+		return result;
 
-	// Step 2: Call get_node_by_path() to get inode of target directory
-
-	// Step 3: Clear data block bitmap of target directory
-
-	// Step 4: Clear inode bitmap and its data block
-
-	// Step 5: Call get_node_by_path() to get inode of parent directory
-
-	// Step 6: Call dir_remove() to remove directory entry of target directory in its parent directory
-
+	if (readi(parent_inode.ino, &parent_inode) == 0 &&
+	    parent_inode.link > 2) {
+		parent_inode.link--;
+		parent_inode.vstat.st_nlink = parent_inode.link;
+		parent_inode.vstat.st_ctime = time(NULL);
+		writei(parent_inode.ino, &parent_inode);
+	}
 	return 0;
 }
 
@@ -587,20 +739,41 @@ static int tfs_releasedir(const char *path, struct fuse_file_info *fi) {
     return 0;
 }
 
+/* Create one empty regular file and link it into its parent. */
 static int tfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+	char parent_path[PATH_MAX];
+	char name[sizeof(((struct dirent *)0)->name)];
+	struct inode parent_inode;
+	struct inode new_inode;
+	struct dirent existing;
+	int new_ino;
+	int result;
 
-	// Step 1: Use dirname() and basename() to separate parent directory path and target file name
+	(void)fi;
+	result = split_parent_path(path, parent_path, name);
+	if (result < 0)
+		return result;
+	result = get_node_by_path(parent_path, 0, &parent_inode);
+	if (result < 0)
+		return result;
+	if (!S_ISDIR(parent_inode.vstat.st_mode))
+		return -ENOTDIR;
+	if (dir_find(parent_inode.ino, name, strlen(name), &existing) == 0)
+		return -EEXIST;
 
-	// Step 2: Call get_node_by_path() to get inode of parent directory
-
-	// Step 3: Call get_avail_ino() to get an available inode number
-
-	// Step 4: Call dir_add() to add directory entry of target file to parent directory
-
-	// Step 5: Update inode for target file
-
-	// Step 6: Call writei() to write inode to disk
-
+	new_ino = get_avail_ino();
+	if (new_ino < 0)
+		return new_ino;
+	initialize_inode(&new_inode, new_ino, S_IFREG | (mode & 07777));
+	if (writei(new_ino, &new_inode) < 0) {
+		release_ino(new_ino);
+		return -EIO;
+	}
+	result = dir_add(parent_inode, new_ino, name, strlen(name));
+	if (result < 0) {
+		delete_inode(&new_inode);
+		return result;
+	}
 	return 0;
 }
 
@@ -643,21 +816,29 @@ static int tfs_write(const char *path, const char *buffer, size_t size, off_t of
 	return size;
 }
 
+/* Remove one regular file and reclaim its inode and direct blocks. */
 static int tfs_unlink(const char *path) {
+	char parent_path[PATH_MAX];
+	char name[sizeof(((struct dirent *)0)->name)];
+	struct inode parent_inode;
+	struct inode target_inode;
+	int result;
 
-	// Step 1: Use dirname() and basename() to separate parent directory path and target file name
-
-	// Step 2: Call get_node_by_path() to get inode of target file
-
-	// Step 3: Clear data block bitmap of target file
-
-	// Step 4: Clear inode bitmap and its data block
-
-	// Step 5: Call get_node_by_path() to get inode of parent directory
-
-	// Step 6: Call dir_remove() to remove directory entry of target file in its parent directory
-
-	return 0;
+	result = split_parent_path(path, parent_path, name);
+	if (result < 0)
+		return result;
+	result = get_node_by_path(path, 0, &target_inode);
+	if (result < 0)
+		return result;
+	if (S_ISDIR(target_inode.vstat.st_mode))
+		return -EISDIR;
+	result = get_node_by_path(parent_path, 0, &parent_inode);
+	if (result < 0)
+		return result;
+	result = dir_remove(parent_inode, name, strlen(name));
+	if (result < 0)
+		return result;
+	return delete_inode(&target_inode);
 }
 
 static int tfs_truncate(const char *path, off_t size) {

@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <time.h>
 #include <libgen.h>
 #include <limits.h>
 
@@ -19,61 +20,129 @@ char diskfile_path[PATH_MAX];
 
 static struct superblock superblock;
 
-/* Return the number of blocks needed to store a byte count. */
-static uint32_t blocks_for_size(size_t size) {
-	return (uint32_t)((size + BLOCK_SIZE - 1) / BLOCK_SIZE);
+/* Return the number of inodes stored in one inode table block. */
+static uint32_t inodes_per_block(void) {
+	return BLOCK_SIZE / sizeof(struct inode);
+}
+
+/* Return the number of blocks reserved for the inode table. */
+static uint32_t inode_table_blocks(void) {
+	uint32_t per_block = inodes_per_block();
+
+	return (MAX_INUM + per_block - 1) / per_block;
+}
+
+/* Clear an allocated inode bit. */
+static int release_ino(uint16_t ino) {
+	unsigned char bitmap[BLOCK_SIZE];
+
+	if (ino >= superblock.max_inum)
+		return -EINVAL;
+	if (bio_read(superblock.i_bitmap_blk, bitmap) != BLOCK_SIZE)
+		return -EIO;
+	unset_bitmap(bitmap, ino);
+	if (bio_write(superblock.i_bitmap_blk, bitmap) != BLOCK_SIZE)
+		return -EIO;
+	return 0;
+}
+
+/* Clear an allocated data block bit. */
+static int release_blkno(int block_no) {
+	unsigned char bitmap[BLOCK_SIZE];
+	int index = block_no - (int)superblock.d_start_blk;
+
+	if (index < 0 || index >= superblock.max_dnum)
+		return -EINVAL;
+	if (bio_read(superblock.d_bitmap_blk, bitmap) != BLOCK_SIZE)
+		return -EIO;
+	unset_bitmap(bitmap, index);
+	if (bio_write(superblock.d_bitmap_blk, bitmap) != BLOCK_SIZE)
+		return -EIO;
+	return 0;
 }
 
 /* 
  * Get available inode number from bitmap
  */
 int get_avail_ino() {
+	unsigned char bitmap[BLOCK_SIZE];
+	int ino;
 
-	// Step 1: Read inode bitmap from disk
-	
-	// Step 2: Traverse inode bitmap to find an available slot
+	/* Allocate the first free inode recorded in the inode bitmap. */
+	if (bio_read(superblock.i_bitmap_blk, bitmap) != BLOCK_SIZE)
+		return -EIO;
 
-	// Step 3: Update inode bitmap and write to disk 
+	for (ino = 0; ino < superblock.max_inum; ino++) {
+		if (get_bitmap(bitmap, ino))
+			continue;
+		set_bitmap(bitmap, ino);
+		if (bio_write(superblock.i_bitmap_blk, bitmap) != BLOCK_SIZE)
+			return -EIO;
+		return ino;
+	}
 
-	return 0;
+	return -ENOSPC;
 }
 
 /* 
  * Get available data block number from bitmap
  */
 int get_avail_blkno() {
+	unsigned char bitmap[BLOCK_SIZE];
+	int index;
 
-	// Step 1: Read data block bitmap from disk
-	
-	// Step 2: Traverse data block bitmap to find an available slot
+	/* Allocate the first free block recorded in the data bitmap. */
+	if (bio_read(superblock.d_bitmap_blk, bitmap) != BLOCK_SIZE)
+		return -EIO;
 
-	// Step 3: Update data block bitmap and write to disk 
+	for (index = 0; index < superblock.max_dnum; index++) {
+		if (get_bitmap(bitmap, index))
+			continue;
+		set_bitmap(bitmap, index);
+		if (bio_write(superblock.d_bitmap_blk, bitmap) != BLOCK_SIZE)
+			return -EIO;
+		return (int)superblock.d_start_blk + index;
+	}
 
-	return 0;
+	return -ENOSPC;
 }
 
 /* 
  * inode operations
  */
 int readi(uint16_t ino, struct inode *inode) {
+	char block[BLOCK_SIZE];
+	uint32_t per_block = inodes_per_block();
+	uint32_t block_no;
+	uint32_t offset;
 
-  // Step 1: Get the inode's on-disk block number
-
-  // Step 2: Get offset of the inode in the inode on-disk block
-
-  // Step 3: Read the block from disk and then copy into inode structure
-
+	/* Read one inode from its fixed slot in the inode table. */
+	if (inode == NULL || ino >= superblock.max_inum || per_block == 0)
+		return -EINVAL;
+	block_no = superblock.i_start_blk + ino / per_block;
+	offset = (ino % per_block) * sizeof(struct inode);
+	if (bio_read(block_no, block) != BLOCK_SIZE)
+		return -EIO;
+	memcpy(inode, block + offset, sizeof(struct inode));
 	return 0;
 }
 
 int writei(uint16_t ino, struct inode *inode) {
+	char block[BLOCK_SIZE];
+	uint32_t per_block = inodes_per_block();
+	uint32_t block_no;
+	uint32_t offset;
 
-	// Step 1: Get the block number where this inode resides on disk
-	
-	// Step 2: Get the offset in the block where this inode resides on disk
-
-	// Step 3: Write inode to disk 
-
+	/* Update one inode in its fixed slot without changing nearby inodes. */
+	if (inode == NULL || ino >= superblock.max_inum || per_block == 0)
+		return -EINVAL;
+	block_no = superblock.i_start_blk + ino / per_block;
+	offset = (ino % per_block) * sizeof(struct inode);
+	if (bio_read(block_no, block) != BLOCK_SIZE)
+		return -EIO;
+	memcpy(block + offset, inode, sizeof(struct inode));
+	if (bio_write(block_no, block) != BLOCK_SIZE)
+		return -EIO;
 	return 0;
 }
 
@@ -137,6 +206,9 @@ int get_node_by_path(const char *path, uint16_t ino, struct inode *inode) {
  */
 int tfs_mkfs() {
 	char block[BLOCK_SIZE];
+	struct inode root_inode;
+	int root_ino;
+	int i;
 
 	/* Create a clean disk and write the fixed on-disk layout. */
 	dev_init(diskfile_path);
@@ -147,8 +219,7 @@ int tfs_mkfs() {
 	superblock.i_bitmap_blk = 1;
 	superblock.d_bitmap_blk = 2;
 	superblock.i_start_blk = 3;
-	superblock.d_start_blk = superblock.i_start_blk +
-		blocks_for_size((size_t)MAX_INUM * sizeof(struct inode));
+	superblock.d_start_blk = superblock.i_start_blk + inode_table_blocks();
 
 	memset(block, 0, sizeof(block));
 	memcpy(block, &superblock, sizeof(superblock));
@@ -160,6 +231,33 @@ int tfs_mkfs() {
 		return -EIO;
 	if (bio_write(superblock.d_bitmap_blk, block) != BLOCK_SIZE)
 		return -EIO;
+
+	root_ino = get_avail_ino();
+	if (root_ino != 0)
+		return root_ino < 0 ? root_ino : -EIO;
+
+	memset(&root_inode, 0, sizeof(root_inode));
+	root_inode.ino = root_ino;
+	root_inode.valid = 1;
+	root_inode.type = S_IFDIR;
+	root_inode.link = 2;
+	for (i = 0; i < 16; i++)
+		root_inode.direct_ptr[i] = -1;
+	for (i = 0; i < 8; i++)
+		root_inode.indirect_ptr[i] = -1;
+	root_inode.vstat.st_ino = root_ino;
+	root_inode.vstat.st_mode = S_IFDIR | 0755;
+	root_inode.vstat.st_nlink = 2;
+	root_inode.vstat.st_uid = getuid();
+	root_inode.vstat.st_gid = getgid();
+	root_inode.vstat.st_blksize = BLOCK_SIZE;
+	root_inode.vstat.st_atime = time(NULL);
+	root_inode.vstat.st_mtime = root_inode.vstat.st_atime;
+	root_inode.vstat.st_ctime = root_inode.vstat.st_atime;
+	if (writei(root_ino, &root_inode) < 0) {
+		release_ino(root_ino);
+		return -EIO;
+	}
 
 	return 0;
 }

@@ -21,6 +21,8 @@ char diskfile_path[PATH_MAX];
 
 static struct superblock superblock;
 
+int get_avail_ino(void);
+int get_avail_blkno(void);
 int readi(uint16_t ino, struct inode *inode);
 int writei(uint16_t ino, struct inode *inode);
 
@@ -162,6 +164,34 @@ static int delete_inode(struct inode *inode) {
 	if (writei(inode->ino, &cleared) < 0)
 		return -EIO;
 	return release_ino(inode->ino);
+}
+
+/* Return one direct file block and allocate it when requested. */
+static int get_file_block(struct inode *inode, uint32_t logical_block,
+			  bool allocate) {
+	char zero_block[BLOCK_SIZE];
+	int block_no;
+
+	if (inode == NULL)
+		return -EINVAL;
+	if (logical_block >= 16)
+		return -EFBIG;
+	if (inode->direct_ptr[logical_block] >= 0)
+		return inode->direct_ptr[logical_block];
+	if (!allocate)
+		return -ENOENT;
+
+	block_no = get_avail_blkno();
+	if (block_no < 0)
+		return block_no;
+	memset(zero_block, 0, sizeof(zero_block));
+	if (bio_write(block_no, zero_block) != BLOCK_SIZE) {
+		release_blkno(block_no);
+		return -EIO;
+	}
+	inode->direct_ptr[logical_block] = block_no;
+	inode->vstat.st_blocks += BLOCK_SIZE / 512;
+	return block_no;
 }
 
 /* 
@@ -791,29 +821,111 @@ static int tfs_open(const char *path, struct fuse_file_info *fi) {
 	return 0;
 }
 
+/* Read regular-file data across direct blocks with offset support. */
 static int tfs_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fi) {
+	struct inode inode;
+	char block[BLOCK_SIZE];
+	size_t completed = 0;
+	size_t available;
+	int result;
 
-	// Step 1: You could call get_node_by_path() to get inode from path
+	(void)fi;
+	if (buffer == NULL || offset < 0)
+		return -EINVAL;
+	result = get_node_by_path(path, 0, &inode);
+	if (result < 0)
+		return result;
+	if (!S_ISREG(inode.vstat.st_mode))
+		return -EISDIR;
+	if ((uint64_t)offset >= inode.size || size == 0)
+		return 0;
 
-	// Step 2: Based on size and offset, read its data blocks from disk
+	available = inode.size - (size_t)offset;
+	if (size > available)
+		size = available;
+	while (completed < size) {
+		uint64_t position = (uint64_t)offset + completed;
+		uint32_t logical_block = position / BLOCK_SIZE;
+		size_t block_offset = position % BLOCK_SIZE;
+		size_t chunk = BLOCK_SIZE - block_offset;
+		int block_no;
 
-	// Step 3: copy the correct amount of data from offset to buffer
+		if (chunk > size - completed)
+			chunk = size - completed;
+		block_no = get_file_block(&inode, logical_block, false);
+		if (block_no == -ENOENT) {
+			memset(buffer + completed, 0, chunk);
+		} else if (block_no < 0) {
+			return completed > 0 ? (int)completed : block_no;
+		} else {
+			if (bio_read(block_no, block) != BLOCK_SIZE)
+				return completed > 0 ? (int)completed : -EIO;
+			memcpy(buffer + completed, block + block_offset, chunk);
+		}
+		completed += chunk;
+	}
 
-	// Note: this function should return the amount of bytes you copied to buffer
-	return 0;
+	inode.vstat.st_atime = time(NULL);
+	writei(inode.ino, &inode);
+	return (int)completed;
 }
 
+/* Write regular-file data across direct blocks with offset support. */
 static int tfs_write(const char *path, const char *buffer, size_t size, off_t offset, struct fuse_file_info *fi) {
-	// Step 1: You could call get_node_by_path() to get inode from path
+	struct inode inode;
+	char block[BLOCK_SIZE];
+	size_t completed = 0;
+	uint64_t end_position;
+	int result;
 
-	// Step 2: Based on size and offset, read its data blocks from disk
+	(void)fi;
+	if (buffer == NULL || offset < 0)
+		return -EINVAL;
+	if (size == 0)
+		return 0;
+	if ((uint64_t)offset > UINT32_MAX ||
+	    size > UINT32_MAX - (uint64_t)offset)
+		return -EFBIG;
+	end_position = (uint64_t)offset + size;
+	if (end_position > (uint64_t)16 * BLOCK_SIZE)
+		return -EFBIG;
 
-	// Step 3: Write the correct amount of data from offset to disk
+	result = get_node_by_path(path, 0, &inode);
+	if (result < 0)
+		return result;
+	if (!S_ISREG(inode.vstat.st_mode))
+		return -EISDIR;
 
-	// Step 4: Update the inode info and write it to disk
+	while (completed < size) {
+		uint64_t position = (uint64_t)offset + completed;
+		uint32_t logical_block = position / BLOCK_SIZE;
+		size_t block_offset = position % BLOCK_SIZE;
+		size_t chunk = BLOCK_SIZE - block_offset;
+		int block_no;
 
-	// Note: this function should return the amount of bytes you write to disk
-	return size;
+		if (chunk > size - completed)
+			chunk = size - completed;
+		block_no = get_file_block(&inode, logical_block, true);
+		if (block_no < 0)
+			break;
+		if (bio_read(block_no, block) != BLOCK_SIZE)
+			break;
+		memcpy(block + block_offset, buffer + completed, chunk);
+		if (bio_write(block_no, block) != BLOCK_SIZE)
+			break;
+		completed += chunk;
+	}
+
+	if (completed == 0)
+		return -EIO;
+	if ((uint64_t)offset + completed > inode.size)
+		inode.size = offset + completed;
+	inode.vstat.st_size = inode.size;
+	inode.vstat.st_mtime = time(NULL);
+	inode.vstat.st_ctime = inode.vstat.st_mtime;
+	if (writei(inode.ino, &inode) < 0)
+		return -EIO;
+	return (int)completed;
 }
 
 /* Remove one regular file and reclaim its inode and direct blocks. */

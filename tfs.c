@@ -17,6 +17,12 @@
 #include "block.h"
 #include "tfs.h"
 
+#define DIRECT_BLOCKS 16
+#define INDIRECT_BLOCKS 8
+#define POINTERS_PER_BLOCK (BLOCK_SIZE / sizeof(int))
+#define MAX_FILE_BLOCKS \
+	(DIRECT_BLOCKS + INDIRECT_BLOCKS * POINTERS_PER_BLOCK)
+
 char diskfile_path[PATH_MAX];
 
 static struct superblock superblock;
@@ -109,9 +115,9 @@ static void initialize_inode(struct inode *inode, uint16_t ino, mode_t mode) {
 	inode->valid = 1;
 	inode->type = mode & S_IFMT;
 	inode->link = S_ISDIR(mode) ? 2 : 1;
-	for (i = 0; i < 16; i++)
+	for (i = 0; i < DIRECT_BLOCKS; i++)
 		inode->direct_ptr[i] = -1;
-	for (i = 0; i < 8; i++)
+	for (i = 0; i < INDIRECT_BLOCKS; i++)
 		inode->indirect_ptr[i] = -1;
 	inode->vstat.st_ino = ino;
 	inode->vstat.st_mode = mode;
@@ -132,7 +138,7 @@ static int directory_is_empty(const struct inode *inode) {
 
 	if (inode == NULL || !S_ISDIR(inode->vstat.st_mode))
 		return -ENOTDIR;
-	for (block_index = 0; block_index < 16; block_index++) {
+	for (block_index = 0; block_index < DIRECT_BLOCKS; block_index++) {
 		if (inode->direct_ptr[block_index] < 0)
 			continue;
 		if (bio_read(inode->direct_ptr[block_index], entries) != BLOCK_SIZE)
@@ -147,17 +153,36 @@ static int directory_is_empty(const struct inode *inode) {
 	return 1;
 }
 
-/* Release direct blocks and clear an inode from disk and bitmap. */
+/* Release all file blocks and clear an inode from disk and bitmap. */
 static int delete_inode(struct inode *inode) {
 	struct inode cleared;
+	int pointers[POINTERS_PER_BLOCK];
 	int block_index;
+	size_t pointer_index;
 
 	if (inode == NULL || inode->ino == 0)
 		return -EINVAL;
-	for (block_index = 0; block_index < 16; block_index++) {
+	for (block_index = 0; block_index < DIRECT_BLOCKS; block_index++) {
 		if (inode->direct_ptr[block_index] < 0)
 			continue;
 		if (release_blkno(inode->direct_ptr[block_index]) < 0)
+			return -EIO;
+	}
+	for (block_index = 0; block_index < INDIRECT_BLOCKS; block_index++) {
+		if (inode->indirect_ptr[block_index] < 0)
+			continue;
+		if (bio_read(inode->indirect_ptr[block_index], pointers) !=
+		    BLOCK_SIZE)
+			return -EIO;
+		for (pointer_index = 0;
+		     pointer_index < POINTERS_PER_BLOCK;
+		     pointer_index++) {
+			if (pointers[pointer_index] < 0)
+				continue;
+			if (release_blkno(pointers[pointer_index]) < 0)
+				return -EIO;
+		}
+		if (release_blkno(inode->indirect_ptr[block_index]) < 0)
 			return -EIO;
 	}
 	memset(&cleared, 0, sizeof(cleared));
@@ -166,21 +191,66 @@ static int delete_inode(struct inode *inode) {
 	return release_ino(inode->ino);
 }
 
-/* Return one direct file block and allocate it when requested. */
+/* Resolve one direct or single-indirect file block. */
 static int get_file_block(struct inode *inode, uint32_t logical_block,
 			  bool allocate) {
 	char zero_block[BLOCK_SIZE];
+	int pointers[POINTERS_PER_BLOCK];
 	int block_no;
+	uint32_t indirect_index;
+	uint32_t pointer_index;
 
 	if (inode == NULL)
 		return -EINVAL;
-	if (logical_block >= 16)
+	if (logical_block >= MAX_FILE_BLOCKS)
 		return -EFBIG;
-	if (inode->direct_ptr[logical_block] >= 0)
-		return inode->direct_ptr[logical_block];
+	if (logical_block < DIRECT_BLOCKS) {
+		if (inode->direct_ptr[logical_block] >= 0)
+			return inode->direct_ptr[logical_block];
+		if (!allocate)
+			return -ENOENT;
+
+		block_no = get_avail_blkno();
+		if (block_no < 0)
+			return block_no;
+		memset(zero_block, 0, sizeof(zero_block));
+		if (bio_write(block_no, zero_block) != BLOCK_SIZE) {
+			release_blkno(block_no);
+			return -EIO;
+		}
+		inode->direct_ptr[logical_block] = block_no;
+		inode->vstat.st_blocks += BLOCK_SIZE / 512;
+		return block_no;
+	}
+
+	logical_block -= DIRECT_BLOCKS;
+	indirect_index = logical_block / POINTERS_PER_BLOCK;
+	pointer_index = logical_block % POINTERS_PER_BLOCK;
+	if (inode->indirect_ptr[indirect_index] < 0) {
+		size_t i;
+
+		if (!allocate)
+			return -ENOENT;
+		block_no = get_avail_blkno();
+		if (block_no < 0)
+			return block_no;
+		for (i = 0; i < POINTERS_PER_BLOCK; i++)
+			pointers[i] = -1;
+		if (bio_write(block_no, pointers) != BLOCK_SIZE) {
+			release_blkno(block_no);
+			return -EIO;
+		}
+		inode->indirect_ptr[indirect_index] = block_no;
+		inode->vstat.st_blocks += BLOCK_SIZE / 512;
+	} else if (bio_read(inode->indirect_ptr[indirect_index], pointers) !=
+		   BLOCK_SIZE) {
+		return -EIO;
+	}
+
+	if (pointers[pointer_index] >= 0)
+		return pointers[pointer_index];
 	if (!allocate)
 		return -ENOENT;
-
 	block_no = get_avail_blkno();
 	if (block_no < 0)
 		return block_no;
@@ -189,7 +259,12 @@ static int get_file_block(struct inode *inode, uint32_t logical_block,
 		release_blkno(block_no);
 		return -EIO;
 	}
-	inode->direct_ptr[logical_block] = block_no;
+	pointers[pointer_index] = block_no;
+	if (bio_write(inode->indirect_ptr[indirect_index], pointers) !=
+	    BLOCK_SIZE) {
+		release_blkno(block_no);
+		return -EIO;
+	}
 	inode->vstat.st_blocks += BLOCK_SIZE / 512;
 	return block_no;
 }
@@ -298,7 +373,7 @@ int dir_find(uint16_t ino, const char *fname, size_t name_len, struct dirent *di
 	if (!S_ISDIR(dir_inode.vstat.st_mode))
 		return -ENOTDIR;
 
-	for (block_index = 0; block_index < 16; block_index++) {
+	for (block_index = 0; block_index < DIRECT_BLOCKS; block_index++) {
 		if (dir_inode.direct_ptr[block_index] < 0)
 			continue;
 		if (bio_read(dir_inode.direct_ptr[block_index], entries) != BLOCK_SIZE)
@@ -344,7 +419,7 @@ int dir_add(struct inode dir_inode, uint16_t f_ino, const char *fname, size_t na
 	if (find_result != -ENOENT)
 		return find_result;
 
-	for (block_index = 0; block_index < 16; block_index++) {
+	for (block_index = 0; block_index < DIRECT_BLOCKS; block_index++) {
 		if (dir_inode.direct_ptr[block_index] < 0) {
 			if (free_block_index < 0)
 				free_block_index = block_index;
@@ -412,7 +487,7 @@ int dir_remove(struct inode dir_inode, const char *fname, size_t name_len) {
 	    name_len >= sizeof(entries[0].name))
 		return -EINVAL;
 
-	for (block_index = 0; block_index < 16; block_index++) {
+	for (block_index = 0; block_index < DIRECT_BLOCKS; block_index++) {
 		bool block_empty = true;
 		bool found = false;
 
@@ -549,9 +624,9 @@ int tfs_mkfs() {
 	root_inode.valid = 1;
 	root_inode.type = S_IFDIR;
 	root_inode.link = 2;
-	for (i = 0; i < 16; i++)
+	for (i = 0; i < DIRECT_BLOCKS; i++)
 		root_inode.direct_ptr[i] = -1;
-	for (i = 0; i < 8; i++)
+	for (i = 0; i < INDIRECT_BLOCKS; i++)
 		root_inode.indirect_ptr[i] = -1;
 	root_inode.vstat.st_ino = root_ino;
 	root_inode.vstat.st_mode = S_IFDIR | 0755;
@@ -659,7 +734,7 @@ static int tfs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, o
 	if (filler(buffer, "..", NULL, 0) != 0)
 		return 0;
 
-	for (block_index = 0; block_index < 16; block_index++) {
+	for (block_index = 0; block_index < DIRECT_BLOCKS; block_index++) {
 		if (inode.direct_ptr[block_index] < 0)
 			continue;
 		if (bio_read(inode.direct_ptr[block_index], entries) != BLOCK_SIZE)
@@ -887,7 +962,7 @@ static int tfs_write(const char *path, const char *buffer, size_t size, off_t of
 	    size > UINT32_MAX - (uint64_t)offset)
 		return -EFBIG;
 	end_position = (uint64_t)offset + size;
-	if (end_position > (uint64_t)16 * BLOCK_SIZE)
+	if (end_position > (uint64_t)MAX_FILE_BLOCKS * BLOCK_SIZE)
 		return -EFBIG;
 
 	result = get_node_by_path(path, 0, &inode);

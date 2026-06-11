@@ -1,0 +1,113 @@
+SHELL := /bin/bash
+.ONESHELL:
+.DEFAULT_GOAL := run
+
+STUDENT_ID := B23040408
+RUN_DIR := /tmp/$(STUDENT_ID)
+# The provided benchmarks use this fixed path and must remain unchanged.
+MOUNT_DIR := /tmp/mountdir
+LOG_FILE := $(CURDIR)/output.log
+DISK_FILE := $(CURDIR)/DISKFILE
+TESTS := simple_test test_case bitmap_check
+
+.PHONY: run check clean-log unmount help
+
+# Build, mount, and run every benchmark on a fresh file system image.
+run:
+	@set -Eeuo pipefail
+	rm -f "$(LOG_FILE)"
+	exec > >(tee -a "$(LOG_FILE)") 2>&1
+
+	log_step() {
+		printf '\n[%s] %s\n' "$$(date '+%F %T')" "$$1"
+	}
+
+	unmount_tfs() {
+		if mountpoint -q "$(MOUNT_DIR)"; then
+			fusermount -u "$(MOUNT_DIR)"
+		fi
+	}
+
+	start_fresh_tfs() {
+		unmount_tfs
+		rm -f "$(DISK_FILE)"
+		mkdir -p "$(RUN_DIR)" "$(MOUNT_DIR)"
+		./tfs -s "$(MOUNT_DIR)"
+
+		for attempt in $$(seq 1 50); do
+			if mountpoint -q "$(MOUNT_DIR)"; then
+				findmnt --target "$(MOUNT_DIR)"
+				return 0
+			fi
+			sleep 0.1
+		done
+
+		echo "TFS failed to mount at $(MOUNT_DIR)" >&2
+		return 1
+	}
+
+	cleanup() {
+		status=$$?
+		unmount_tfs || true
+		if (( status == 0 )); then
+			log_step "All experiments completed successfully"
+		else
+			log_step "Experiment run failed with status $$status"
+		fi
+		trap - EXIT
+		exit $$status
+	}
+	trap cleanup EXIT
+
+	log_step "Checking Ubuntu 22.04 environment"
+	test "$$(. /etc/os-release; echo "$$ID")" = "ubuntu"
+	test "$$(. /etc/os-release; echo "$$VERSION_ID")" = "22.04"
+	for command in gcc make pkg-config findmnt mountpoint fusermount; do
+		command -v "$$command" >/dev/null
+	done
+	pkg-config --exists fuse
+
+	log_step "Student ID: $(STUDENT_ID)"
+	log_step "Building TFS"
+	$(MAKE) -f Makefile clean
+	$(MAKE) -f Makefile tfs
+
+	log_step "Building benchmarks"
+	$(MAKE) -C benchmark clean
+	$(MAKE) -C benchmark all
+
+	for test_name in $(TESTS); do
+		log_step "Preparing a fresh TFS for $$test_name"
+		start_fresh_tfs
+		log_step "Running $$test_name"
+		"./benchmark/$$test_name"
+		unmount_tfs
+	done
+
+# Verify required Ubuntu commands without running the experiments.
+check:
+	@set -euo pipefail
+	test "$$(. /etc/os-release; echo "$$ID")" = "ubuntu"
+	test "$$(. /etc/os-release; echo "$$VERSION_ID")" = "22.04"
+	for command in gcc make pkg-config findmnt mountpoint fusermount; do
+		command -v "$$command" >/dev/null
+	done
+	pkg-config --exists fuse
+	echo "Ubuntu 22.04 FUSE environment is ready."
+
+# Remove the generated experiment log.
+clean-log:
+	rm -f "$(LOG_FILE)"
+
+# Unmount the fixed benchmark mount point when recovery is needed.
+unmount:
+	@if mountpoint -q "$(MOUNT_DIR)"; then \
+		fusermount -u "$(MOUNT_DIR)"; \
+	fi
+
+# Print the available runner targets.
+help:
+	@echo "make -f Makefile.run run        Build and run all experiments"
+	@echo "make -f Makefile.run check      Check Ubuntu 22.04 dependencies"
+	@echo "make -f Makefile.run unmount    Unmount /tmp/mountdir"
+	@echo "make -f Makefile.run clean-log  Remove output.log"

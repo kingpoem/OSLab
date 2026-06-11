@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -13,7 +14,7 @@
 
 int diskfile = -1;
 
-//Creates a file which is your new emulated disk
+/* Create and size the flat file used as the emulated disk. */
 void dev_init(const char* diskfile_path) {
     if (diskfile >= 0) {
 		return;
@@ -25,10 +26,15 @@ void dev_init(const char* diskfile_path) {
 		exit(EXIT_FAILURE);
     }
 	
-    ftruncate(diskfile, DISK_SIZE);
+	    if (ftruncate(diskfile, DISK_SIZE) < 0) {
+			perror("disk resize failed");
+			close(diskfile);
+			diskfile = -1;
+			exit(EXIT_FAILURE);
+	    }
 }
 
-//Function to open the disk file
+/* Open an existing flat file used as the emulated disk. */
 int dev_open(const char* diskfile_path) {
     if (diskfile >= 0) {
 		return 0;
@@ -42,32 +48,64 @@ int dev_open(const char* diskfile_path) {
 	return 0;
 }
 
+/* Close the emulated disk file. */
 void dev_close() {
-    if (diskfile >= 0) {
-		close(diskfile);
-    }
+	    if (diskfile >= 0) {
+			close(diskfile);
+			diskfile = -1;
+	    }
 }
 
-//Read a block from the disk
+/* Read exactly one block from the emulated disk. */
 int bio_read(const int block_num, void *buf) {
-    int retstat = 0;
-    retstat = pread(diskfile, buf, BLOCK_SIZE, block_num*BLOCK_SIZE);
-    if (retstat <= 0) {
-		memset (buf, 0, BLOCK_SIZE);
-		if (retstat < 0)
+	ssize_t completed = 0;
+
+	if (diskfile < 0 || block_num < 0 || buf == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	while (completed < BLOCK_SIZE) {
+		ssize_t ret = pread(diskfile, (char *)buf + completed,
+				    BLOCK_SIZE - completed,
+				    (off_t)block_num * BLOCK_SIZE + completed);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
 			perror("block_read failed");
-    }
+			return -1;
+		}
+		if (ret == 0) {
+			memset((char *)buf + completed, 0, BLOCK_SIZE - completed);
+			break;
+		}
+		completed += ret;
+	}
 
-    return retstat;
+	return BLOCK_SIZE;
 }
 
-//Write a block to the disk
+/* Write exactly one block to the emulated disk. */
 int bio_write(const int block_num, const void *buf) {
-    int retstat = 0;
-    retstat = pwrite(diskfile, buf, BLOCK_SIZE, block_num*BLOCK_SIZE);
-    if (retstat < 0) {
-		    perror("block_write failed");
-    }
-    return retstat;
-}
+	ssize_t completed = 0;
 
+	if (diskfile < 0 || block_num < 0 || buf == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	while (completed < BLOCK_SIZE) {
+		ssize_t ret = pwrite(diskfile, (const char *)buf + completed,
+				     BLOCK_SIZE - completed,
+				     (off_t)block_num * BLOCK_SIZE + completed);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("block_write failed");
+			return -1;
+		}
+		completed += ret;
+	}
+
+	return BLOCK_SIZE;
+}

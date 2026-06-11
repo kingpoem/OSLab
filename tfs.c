@@ -17,7 +17,12 @@
 
 char diskfile_path[PATH_MAX];
 
-// Declare your in-memory data structures here
+static struct superblock superblock;
+
+/* Return the number of blocks needed to store a byte count. */
+static uint32_t blocks_for_size(size_t size) {
+	return (uint32_t)((size + BLOCK_SIZE - 1) / BLOCK_SIZE);
+}
 
 /* 
  * Get available inode number from bitmap
@@ -131,18 +136,30 @@ int get_node_by_path(const char *path, uint16_t ino, struct inode *inode) {
  * Make file system
  */
 int tfs_mkfs() {
+	char block[BLOCK_SIZE];
 
-	// Call dev_init() to initialize (Create) Diskfile
+	/* Create a clean disk and write the fixed on-disk layout. */
+	dev_init(diskfile_path);
+	memset(&superblock, 0, sizeof(superblock));
+	superblock.magic_num = MAGIC_NUM;
+	superblock.max_inum = MAX_INUM;
+	superblock.max_dnum = MAX_DNUM;
+	superblock.i_bitmap_blk = 1;
+	superblock.d_bitmap_blk = 2;
+	superblock.i_start_blk = 3;
+	superblock.d_start_blk = superblock.i_start_blk +
+		blocks_for_size((size_t)MAX_INUM * sizeof(struct inode));
 
-	// write superblock information
+	memset(block, 0, sizeof(block));
+	memcpy(block, &superblock, sizeof(superblock));
+	if (bio_write(0, block) != BLOCK_SIZE)
+		return -EIO;
 
-	// initialize inode bitmap
-
-	// initialize data block bitmap
-
-	// update bitmap information for root directory
-
-	// update inode for root directory
+	memset(block, 0, sizeof(block));
+	if (bio_write(superblock.i_bitmap_blk, block) != BLOCK_SIZE)
+		return -EIO;
+	if (bio_write(superblock.d_bitmap_blk, block) != BLOCK_SIZE)
+		return -EIO;
 
 	return 0;
 }
@@ -152,21 +169,33 @@ int tfs_mkfs() {
  * FUSE file operations
  */
 static void *tfs_init(struct fuse_conn_info *conn) {
+	char block[BLOCK_SIZE];
 
-	// Step 1a: If disk file is not found, call mkfs
+	/* Open an existing file system or create a new formatted disk. */
+	(void)conn;
+	if (access(diskfile_path, F_OK) != 0) {
+		if (tfs_mkfs() < 0)
+			return NULL;
+	} else if (dev_open(diskfile_path) < 0) {
+		return NULL;
+	}
 
-  // Step 1b: If disk file is found, just initialize in-memory data structures
-  // and read superblock from disk
+	if (bio_read(0, block) != BLOCK_SIZE)
+		return NULL;
+	memcpy(&superblock, block, sizeof(superblock));
+	if (superblock.magic_num != MAGIC_NUM) {
+		fprintf(stderr, "Invalid TFS disk image\n");
+		dev_close();
+		return NULL;
+	}
 
 	return NULL;
 }
 
 static void tfs_destroy(void *userdata) {
-
-	// Step 1: De-allocate in-memory data structures
-
-	// Step 2: Close diskfile
-
+	/* Close the disk when FUSE unmounts the file system. */
+	(void)userdata;
+	dev_close();
 }
 
 static int tfs_getattr(const char *path, struct stat *stbuf) {
@@ -369,4 +398,3 @@ int main(int argc, char *argv[]) {
 
 	return fuse_stat;
 }
-

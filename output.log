@@ -1,0 +1,66 @@
+
+[2026-06-14 02:33:23] Checking Ubuntu environment
+
+[2026-06-14 02:33:23] Student ID: B23040408
+
+[2026-06-14 02:33:23] Building TFS
+make[1]: Entering directory '/home/poem/github/OSLab'
+rm -f *.o tfs
+make[1]: Leaving directory '/home/poem/github/OSLab'
+make[1]: Entering directory '/home/poem/github/OSLab'
+gcc -c -g -Wall -D_FILE_OFFSET_BITS=64 tfs.c -o tfs.o
+gcc -c -g -Wall -D_FILE_OFFSET_BITS=64 block.c -o block.o
+gcc tfs.o block.o -lfuse -o tfs
+make[1]: Leaving directory '/home/poem/github/OSLab'
+
+[2026-06-14 02:33:24] Building benchmarks
+make[1]: Entering directory '/home/poem/github/OSLab/benchmark'
+rm -rf simple_test test_case bitmap_check
+make[1]: Leaving directory '/home/poem/github/OSLab/benchmark'
+make[1]: Entering directory '/home/poem/github/OSLab/benchmark'
+gcc -g -o simple_test simple_test.c
+gcc -g -o test_case test_case.c
+gcc -g -o bitmap_check bitmap_check.c
+make[1]: Leaving directory '/home/poem/github/OSLab/benchmark'
+
+[2026-06-14 02:33:24] Preparing a fresh TFS for simple_test
+TARGET        SOURCE FSTYPE   OPTIONS
+/tmp/mountdir tfs    fuse.tfs rw,nosuid,nodev,relatime,user_id=1000,group_id=1000
+
+[2026-06-14 02:33:24] Running simple_test
+TEST 1: File create Success 
+TEST 2: File write Success 
+TEST 3: File close Success 
+TEST 4: File read Success 
+TEST 5: File unlink success 
+TEST 6: Directory create success 
+TEST 7: Sub-directory create success 
+Benchmark completed 
+
+[2026-06-14 02:33:24] Preparing a fresh TFS for test_case
+TARGET        SOURCE FSTYPE   OPTIONS
+/tmp/mountdir tfs    fuse.tfs rw,nosuid,nodev,relatime,user_id=1000,group_id=1000
+
+[2026-06-14 02:33:24] Running test_case
+TEST 1: File create Success 
+TEST 2: File write Success 
+TEST 3: File close Success 
+TEST 4: File read Success 
+TEST 5: File unlink success 
+TEST 6: Directory create success 
+TEST 7: Directory remove success 
+TEST 8: Sub-directory create success 
+TEST 9: Large file write success 
+TEST 10: Large file read Success 
+Benchmark completed 
+
+[2026-06-14 02:33:24] Preparing a fresh TFS for bitmap_check
+TARGET        SOURCE FSTYPE   OPTIONS
+/tmp/mountdir tfs    fuse.tfs rw,nosuid,nodev,relatime,user_id=1000,group_id=1000
+
+[2026-06-14 02:33:24] Running bitmap_check
+inodes reclaimed successfully 0
+data blocks reclaimed successfully 0
+Benchmark completed 
+
+[2026-06-14 02:33:24] All experiments completed successfully

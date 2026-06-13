@@ -59,9 +59,12 @@ run:
 	}
 	trap cleanup EXIT
 
-	log_step "Checking Ubuntu 22.04 environment"
+	log_step "Checking Ubuntu environment"
 	test "$$(. /etc/os-release; echo "$$ID")" = "ubuntu"
-	test "$$(. /etc/os-release; echo "$$VERSION_ID")" = "22.04"
+	case "$$(. /etc/os-release; echo "$$VERSION_ID")" in
+	22.04|24.04) ;;
+	*) echo "Unsupported Ubuntu version: $$(. /etc/os-release; echo "$$VERSION_ID")" >&2; exit 1 ;;
+	esac
 	for command in gcc make pkg-config findmnt mountpoint fusermount; do
 		command -v "$$command" >/dev/null
 	done
@@ -88,12 +91,15 @@ run:
 check:
 	@set -euo pipefail
 	test "$$(. /etc/os-release; echo "$$ID")" = "ubuntu"
-	test "$$(. /etc/os-release; echo "$$VERSION_ID")" = "22.04"
+	case "$$(. /etc/os-release; echo "$$VERSION_ID")" in
+	22.04|24.04) ;;
+	*) echo "Unsupported Ubuntu version: $$(. /etc/os-release; echo "$$VERSION_ID")" >&2; exit 1 ;;
+	esac
 	for command in gcc make pkg-config findmnt mountpoint fusermount; do
 		command -v "$$command" >/dev/null
 	done
 	pkg-config --exists fuse
-	echo "Ubuntu 22.04 FUSE environment is ready."
+	echo "Ubuntu FUSE environment is ready."
 
 # Remove the generated experiment log.
 clean-log:

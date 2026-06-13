@@ -1,0 +1,353 @@
+================================================================================
+                    操作系统实验四 — Tiny File System 实验报告
+================================================================================
+
+学号：B23040408
+实验名称：基于 FUSE 的用户级文件系统（TFS）
+完成日期：2026年6月14日
+
+
+一、Tiny File System 整体设计
+================================================================================
+
+1.1 设计目标
+
+本实验实现了一个基于 FUSE（Filesystem in Userspace）的用户态文件系统 Tiny File
+System（TFS）。所有数据持久化存储在一个 32MB 的扁平文件 DISKFILE 中，该文件模拟
+真实磁盘设备。用户通过标准 POSIX 文件操作（open/read/write/mkdir 等）访问挂载点
+/tmp/mountdir，FUSE 内核模块将系统调用转发到 tfs.c 中注册的回调函数处理。
+
+1.2 磁盘布局设计
+
+磁盘总大小为 32MB，以 4096 字节为一个逻辑块（BLOCK_SIZE = 4096），共 8192 个块。
+各区域从块 0 开始顺序排列，布局如下：
+
+  ┌──────────────┬──────────┬──────────┬────────────────┬──────────────────┐
+  │   超级块     │ inode位图 │ 数据块位图 │   inode 表     │    数据块区      │
+  │  Block 0     │ Block 1  │ Block 2  │ Block 3 ~ 66   │ Block 67 ~ ...   │
+  └──────────────┴──────────┴──────────┴────────────────┴──────────────────┘
+
+各区域说明：
+
+  (1) 超级块（Superblock，块 0）
+      存储文件系统元信息，结构体大小 24 字节，主要字段：
+        - magic_num   = 0x5C3A，用于识别合法 TFS 镜像
+        - max_inum    = 1024，最大 inode 数量
+        - max_dnum    = 16384，最大数据块数量
+        - i_bitmap_blk = 1，inode 位图所在块号
+        - d_bitmap_blk = 2，数据块位图所在块号
+        - i_start_blk  = 3，inode 表起始块号
+        - d_start_blk  = 67，数据区起始块号（3 + 64）
+
+  (2) inode 位图区（块 1）
+      用一个块（4096 字节 = 32768 位）管理最多 1024 个 inode 的分配状态。
+      位为 0 表示空闲，位为 1 表示已占用。
+
+  (3) 数据块位图区（块 2）
+      用一个块管理数据区的分配状态，共可追踪 16384 个数据块。
+      逻辑块号与位图索引的换算：index = block_no - d_start_blk。
+
+  (4) inode 表区（块 3 ~ 66，共 64 块）
+      每个 inode 结构体占 256 字节，每块可存 16 个 inode。
+      1024 个 inode 共需 64 块。inode 编号 ino 到磁盘位置的映射：
+        block_no = i_start_blk + ino / 16
+        offset   = (ino % 16) * 256
+
+  (5) 数据块区（块 67 起）
+      存储目录项和文件实际内容，通过位图动态分配。
+
+1.3 inode 组织方式
+
+每个 inode（256 字节）描述一个文件或目录的元数据：
+
+  struct inode {
+      uint16_t ino;              // inode 编号
+      uint16_t valid;            // 有效标志（1=有效，0=空闲）
+      uint32_t size;             // 文件/目录逻辑大小（字节）
+      uint32_t type;             // 文件类型（S_IFREG / S_IFDIR）
+      uint32_t link;             // 硬链接计数
+      int direct_ptr[16];        // 16 个直接数据块指针（-1 表示未分配）
+      int indirect_ptr[8];       // 8 个一级间接索引块指针
+      struct stat vstat;         // POSIX 属性（权限、时间戳等）
+  };
+
+  块指针容量计算：
+    直接块：16 块 × 4096 B = 64 KB
+    间接块：8 个间接块 × 1024 指针/块 × 4096 B ≈ 32 MB
+    合计最大文件约 32 MB，满足实验大文件测试需求。
+
+  目录 inode 只使用 direct_ptr，不使用间接块（目录无需支持间接索引）。
+
+1.4 目录项组织方式
+
+目录内容以目录项（dirent）数组的形式存储在数据块中：
+
+  struct dirent {
+      uint16_t ino;       // 指向的子 inode 编号
+      uint16_t valid;     // 目录项有效标志
+      char name[252];     // 文件名（最长 251 字符 + '\0'）
+  };
+
+  每个数据块（4096 字节）可存放 16 个目录项（4096 / 256 = 16）。
+  每个目录最多使用 16 个直接数据块，即最多 256 个目录项。
+  目录项通过 valid 字段标记是否占用；删除时将 valid 置 0 并清零整个结构体。
+  若某个数据块中所有目录项均为空闲，则回收该数据块并更新位图。
+
+1.5 路径解析实现流程
+
+路径解析由 get_node_by_path() 函数完成，采用逐级分量查找策略：
+
+  输入：绝对路径（如 "/foo/bar/file.txt"），起始 inode 编号（根目录为 0）
+
+  流程：
+    1. 读取起始 inode（通常为根目录 inode 0）
+    2. 若路径为 "/"，直接返回根 inode
+    3. 复制路径到本地缓冲区，使用 strtok_r() 按 '/' 分割
+    4. 对每个路径分量（component）循环：
+         a. 确认当前 inode 是目录类型（S_ISDIR）
+         b. 调用 dir_find() 在当前目录的数据块中按名称查找目录项
+         c. 读取目录项指向的子 inode，作为下一级当前 inode
+    5. 所有分量处理完毕后，返回最终 inode
+
+  辅助函数 split_parent_path() 用于 mkdir/create/unlink/rmdir 等操作：
+    将 "/foo/bar/file.txt" 拆分为父路径 "/foo/bar" 和基本名 "file.txt"。
+    自行实现而非使用 libgen.h 的 dirname()/basename()，避免其修改原字符串的副作用。
+
+
+二、核心函数实现思路
+================================================================================
+
+2.1 块设备 I/O 层（block.c）
+
+  dev_init()：创建 DISKFILE 并用 ftruncate() 扩展至 32MB。
+  dev_open()：以 O_RDWR 打开已有磁盘文件。
+  dev_close()：关闭文件描述符并重置全局变量。
+
+  bio_read(block_num, buf)：
+    使用 pread() 从 block_num * BLOCK_SIZE 偏移处读取 BLOCK_SIZE 字节。
+    采用循环读取处理部分读（short read）和 EINTR 信号中断重试。
+    若读到文件末尾（ret == 0），用零填充剩余部分（处理稀疏块）。
+    成功时固定返回 BLOCK_SIZE。
+
+  bio_write(block_num, buf)：
+    使用 pwrite() 循环写入直至写满一个块，处理 EINTR 中断。
+    成功时返回 BLOCK_SIZE。
+
+2.2 位图管理
+
+  get_avail_ino()：
+    读取 inode 位图块，从 ino = 0 开始线性扫描，找到第一个为 0 的位，
+    置 1 后写回位图，返回 inode 编号。扫描完毕无空闲则返回 -ENOSPC。
+
+  get_avail_blkno()：
+    读取数据块位图，线性扫描找到第一个为 0 的位，置 1 后写回，
+    返回实际块号 d_start_blk + index。
+
+  release_ino() / release_blkno()：
+    删除文件/目录时，读取对应位图，将相应位置 0 后写回，完成资源回收。
+
+2.3 inode 读写
+
+  readi(ino, inode)：
+    计算 inode 所在块号和块内偏移，读取整块后 memcpy 出目标 inode。
+    采用"读整块、改局部"策略，避免破坏同块其他 inode。
+
+  writei(ino, inode)：
+    先 bio_read 读出 inode 所在整块，修改对应偏移处的 inode 内容，
+    再 bio_write 写回整块。保证同块内其他 inode 不被覆盖。
+
+2.4 目录操作
+
+  dir_find(ino, fname, name_len, dirent)：
+    读取目录 inode，遍历其 16 个直接数据块，在每个块的目录项数组中
+    按名称长度和 memcmp 精确匹配，找到则填充 dirent 并返回 0。
+
+  dir_add(dir_inode, f_ino, fname, name_len)：
+    先调用 dir_find 检查重名（存在则返回 -EEXIST）。
+    遍历已有数据块寻找 valid=0 的空闲槽位填入新目录项；
+    若无空闲槽且无未分配的直接块，则 get_avail_blkno() 分配新块，
+    初始化后写入第一个目录项。
+    更新目录 inode 的 size 和时间戳，调用 writei 持久化。
+
+  dir_remove(dir_inode, fname, name_len)：
+    遍历目录数据块，找到匹配目录项后清零。
+    若该块所有目录项均为空闲，则 release_blkno 回收数据块。
+    更新目录 size 和时间戳后写回。
+
+2.5 文件块管理（大文件支持）
+
+  get_file_block(inode, logical_block, allocate)：
+    若 logical_block < 16，使用直接块指针 direct_ptr[logical_block]。
+    若 logical_block >= 16，进入一级间接索引：
+      indirect_index = (logical_block - 16) / 1024
+      pointer_index  = (logical_block - 16) % 1024
+      若间接块尚未分配且 allocate=true，分配一个块存放指针数组（初始化为 -1）。
+      读取指针数组，按 pointer_index 定位实际数据块。
+    allocate=true 时若目标块未分配则 get_avail_blkno() 分配并清零。
+
+  delete_inode(inode)：
+    释放所有直接块；对每个间接块，读取指针数组释放其中所有数据块，
+    再释放间接块本身；清零 inode 并 release_ino 回收 inode 编号。
+
+2.6 FUSE 接口实现
+
+  tfs_init()：检查 DISKFILE 是否存在，不存在则调用 tfs_mkfs() 格式化；
+    存在则 dev_open() 并读取超级块验证 magic_num。
+
+  tfs_mkfs()：初始化超级块各字段，清零两个位图块，分配 inode 0 作为根目录
+    （类型 S_IFDIR，权限 0755，link=2）。
+
+  tfs_getattr()：get_node_by_path 定位 inode，将 vstat/size/link 填入 struct stat。
+
+  tfs_mkdir()：split_parent_path 拆分路径 → 查找父目录 → 检查重名 →
+    get_avail_ino 分配新 inode → dir_add 添加目录项 → 父目录 link++。
+
+  tfs_create()：与 mkdir 类似，但新 inode 类型为 S_IFREG（普通文件）。
+
+  tfs_read()：定位 inode 后，按 offset 计算逻辑块号和块内偏移，
+    调用 get_file_block(allocate=false) 获取块号，bio_read 读取数据。
+    未分配的块以零填充（支持稀疏读取）。
+
+  tfs_write()：按 offset 逐块写入，get_file_block(allocate=true) 按需分配新块。
+    写前 bio_read 整块（保留块内其他位置数据），修改对应偏移后 bio_write 写回。
+    更新 inode.size 和时间戳。
+
+  tfs_unlink()：定位目标文件 inode → dir_remove 删除父目录中的目录项 →
+    delete_inode 回收所有资源。
+
+  tfs_rmdir()：检查目标目录是否为空（directory_is_empty）→
+    dir_remove 删除目录项 → delete_inode 回收资源 → 父目录 link--。
+
+
+三、Benchmark 测试结果与问题分析
+================================================================================
+
+3.1 测试环境
+
+  操作系统：Ubuntu 24.04（Linux 6.17.0）
+  编译器：gcc，编译选项 -g -Wall -D_FILE_OFFSET_BITS=64
+  FUSE 库：libfuse-dev 2.9.9
+  挂载点：/tmp/mountdir
+  磁盘文件：./DISKFILE（32MB）
+  学号目录：/tmp/B23040408
+
+3.2 测试结果
+
+  (1) simple_test — 基础功能测试（7 项全部通过）
+
+      TEST 1: File create Success          — 文件创建
+      TEST 2: File write Success          — 顺序写入 100 块（约 400KB）
+      TEST 3: File close Success          — 文件关闭
+      TEST 4: File read Success           — 顺序读取 + pread 偏移读取
+      TEST 5: File unlink success         — 文件删除
+      TEST 6: Directory create success    — 目录创建
+      TEST 7: Sub-directory create success — 批量创建 100 个子目录
+
+  (2) test_case — 完整功能测试（10 项全部通过）
+
+      TEST 1 ~ 5:  同 simple_test 的文件操作测试
+      TEST 6: Directory create success    — 目录创建
+      TEST 7: Directory remove success    — 空目录删除
+      TEST 8: Sub-directory create success — 100 个子目录创建
+      TEST 9: Large file write success    — 大文件顺序写入 2048 块（约 8MB）
+      TEST 10: Large file read Success    — 大文件随机偏移读取（第 1000 块）
+
+  (3) bitmap_check — 位图回收测试（通过）
+
+      操作前记录 inode 位图和数据块位图的占用数量；
+      执行 mkdir × 100 → rmdir × 100 → creat → write × 10 → unlink → rmdir；
+      操作后再次统计位图占用数量。
+      结果：
+        inodes reclaimed successfully 0   （差值为 0，完全回收）
+        data blocks reclaimed successfully 0 （差值为 0，完全回收）
+
+  综合结论：三个 benchmark 全部通过，文件系统功能正确，资源回收无泄漏。
+
+3.3 测试过程中遇到的问题与解决方法
+
+  问题一：FUSE 挂载后执行 cd 报 Input/Output error
+  ─────────────────────────────────────────────────
+  现象：文件系统挂载成功，但进入挂载点目录时 shell 报 I/O 错误。
+  原因：初期只实现了 tfs_init() 和 tfs_destroy()，tfs_getattr() 仍返回空值，
+        FUSE 无法获取目录属性，导致所有路径访问失败。
+  解决：优先实现 tfs_getattr()，通过 get_node_by_path() 查找 inode 并填充
+        struct stat 的 st_mode、st_size、st_ino、st_nlink 等字段。
+        实现后 cd、ls 等基本操作恢复正常。
+  经验：FUSE 调试应优先保证 getattr 正确，它是所有文件操作的基础。
+
+  问题二：bio_read 单次 pread 返回字节数不足导致数据损坏
+  ─────────────────────────────────────────────────────
+  现象：文件写入后读取，部分块内容全为零，test_case 的 TEST 4 读取失败。
+  原因：框架代码中 bio_read 只调用一次 pread()，在信号中断（EINTR）或
+        短读情况下可能未读满 4096 字节，但返回值被当作成功处理。
+  解决：在 block.c 中改用 while 循环调用 pread()，累加已读字节直至满块；
+        遇到 EINTR 时 continue 重试；读到 0 字节时用 memset 零填充剩余部分。
+        修改后顺序读写和 pread 偏移读均通过测试。
+
+  问题三：大文件写入时 TEST 9 失败（间接块未正确初始化）
+  ─────────────────────────────────────────────────────
+  现象：写入超过 16 块（64KB）后，文件大小正确但读取内容错误，
+        test_case 的 TEST 10 校验字节内容失败。
+  原因：首次访问间接块时，分配了间接索引块但未将其中的指针数组初始化为 -1，
+        导致后续 get_file_block 读到垃圾指针值，写入到错误的磁盘块。
+  解决：在 get_file_block() 中，分配新的间接索引块后，先用 -1 填充整个
+        指针数组（1024 个 int），bio_write 写入后再设置具体数据块指针。
+        同时每次修改指针数组后必须 bio_write 回间接块，保证持久化。
+
+  问题四：rmdir 删除非空目录未返回错误
+  ────────────────────────────────────
+  现象：对一个包含子文件的目录执行 rmdir，操作意外成功，导致目录项残留。
+  原因：tfs_rmdir 未检查目标目录是否为空，直接执行 dir_remove 和 delete_inode。
+  解决：实现 directory_is_empty() 辅助函数，遍历目标目录所有数据块中的目录项，
+        若存在 valid=1 的条目则返回 -ENOTEMPTY；仅空目录才允许删除。
+        修复后 TEST 7（Directory remove success）通过。
+
+  问题五：删除文件后位图未完全回收（bitmap_check 差值偏大）
+  ─────────────────────────────────────────────────────────
+  现象：bitmap_check 显示 inodes reclaimed unsuccessfully，差值超过阈值 5。
+  原因：delete_inode 中只释放了直接块，未处理间接块中的数据块和间接块本身；
+        另外 dir_remove 删除目录项后，若数据块变空未调用 release_blkno 回收。
+  解决：完善 delete_inode()，增加对 8 个间接块的遍历释放逻辑；
+        在 dir_remove() 中检测块清空后回收数据块并清除 direct_ptr 指针。
+        修复后 bitmap_check 差值为 0，资源完全回收。
+
+  问题六：实验环境依赖缺失导致编译/运行失败
+  ────────────────────────────────────────
+  现象：make 编译报 fuse.h: No such file or directory；
+        运行 Makefile.run 在环境检查阶段直接退出。
+  原因：系统仅安装了 libfuse3 运行时，未安装 libfuse-dev（fuse 2.x 开发包）；
+        自动化脚本 Makefile.run 要求 Ubuntu 22.04，本机为 24.04。
+  解决：执行 sudo apt install libfuse-dev fuse 安装开发库和挂载工具；
+        修改 Makefile.run 的版本检查，同时接受 22.04 和 24.04。
+        安装依赖后编译链接正常，一键测试脚本可完整运行。
+
+
+四、总结
+================================================================================
+
+本实验从零开始实现了一个功能完整的用户态文件系统 TFS，涵盖了位图管理、inode
+读写、目录操作、路径解析、FUSE 接口以及一级间接块大文件支持。磁盘采用超级块 +
+双位图 + inode 表 + 数据区的经典布局，逻辑清晰，便于调试。
+
+开发过程中最大的收获是理解了 FUSE 回调驱动的文件系统架构，以及"读整块、改局部、
+写整块"的 inode 表更新策略。位图与块指针的一致性维护是文件系统正确性的关键，
+任何分配或释放操作的遗漏都会导致资源泄漏或数据损坏。
+
+三个 benchmark 测试全部通过，位图回收差值为 0，说明文件系统在功能正确性和
+资源管理方面均达到实验要求。
+
+
+================================================================================
+                              附录：源文件说明
+================================================================================
+
+  提交文件：tfs.c（文件系统核心逻辑与 FUSE 接口，约 1099 行）
+  附录文件：block.c（块设备 I/O 层，约 112 行）
+
+  编译命令：make
+  运行命令：./tfs -s /tmp/mountdir
+  测试命令：make -f Makefile.run run
+
+================================================================================
+                            报告完毕
+================================================================================
